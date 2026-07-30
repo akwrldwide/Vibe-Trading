@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: vibe-trading-alpaca-bridge
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn alpaca_bridge:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: ALPACA_API_KEY
+        sync: false
+      - key: ALPACA_SECRET_KEY
+        sync: false
+      - key: ALPACA_BASE_URL
+        value: https://paper-api.alpaca.markets
+      - key: WEBHOOK_PASSCODE
+        sync: false

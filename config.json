@@ -1,0 +1,15 @@
+{
+  "codes": ["EURUSD=X", "GBPUSD=X"],
+  "start_date": "2025-01-01",
+  "end_date": "2025-06-30",
+  "interval": "1m",
+  "source": "yfinance",
+  "initial_cash": 100000.0,
+  "commission_rate": 0.00002,
+  "slippage": 0.0001,
+  "strategy": {
+    "engine": "NYOpenICTSignalEngine",
+    "rr_ratio": 3.0,
+    "htf_ema_period": 50
+  }
+}
