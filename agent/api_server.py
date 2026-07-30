@@ -303,6 +303,14 @@ from src.api.scheduled_routes import (  # noqa: E402, F401
 
 
 # ============================================================================
+# Alpaca Paper Trading Webhook Bridge Routes
+# ============================================================================
+from alpaca_bridge import handle_webhook, cancel_all_orders
+
+app.add_api_route("/webhook", handle_webhook, methods=["POST"])
+app.add_api_route("/cancel_all", cancel_all_orders, methods=["POST"])
+
+# ============================================================================
 # Main Entry Point
 # ============================================================================
 
