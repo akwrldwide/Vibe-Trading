@@ -79,6 +79,10 @@ async def confirm_signal_execution(request: Request):
 def get_trades():
     return load_signals()
 
+from telegram_notifier import TelegramNotifier
+
+telegram = TelegramNotifier()
+
 @app.post("/webhook")
 async def handle_webhook(request: Request):
     try:
@@ -100,9 +104,18 @@ async def handle_webhook(request: Request):
         raise HTTPException(status_code=401, detail="Unauthorized passcode mismatch")
 
     action = data.get("action", "").upper()
+    symbol = data.get("symbol", "").replace("/", "").replace("PERP", "").replace(".P", "")
+    limit_price = float(data.get("limit_price", data.get("price", 0)))
+    stop_loss = float(data.get("stop_loss", 0))
+    take_profit = float(data.get("take_profit", 0))
+
+    # Breakeven Alert
+    if action == "BREAKEVEN":
+        logging.info(f"🛡️ Breakeven Alert Received: {symbol} SL moved to {stop_loss}")
+        telegram.send_breakeven_alert(symbol=symbol, entry_price=limit_price, new_sl=stop_loss)
+        return {"status": "success", "message": "Breakeven alert sent to Telegram"}
 
     if action == "CANCEL":
-        symbol = data.get("symbol", "").replace("/", "").replace("PERP", "").replace(".P", "")
         signal_entry = {
             "id": str(uuid.uuid4()),
             "action": "CANCEL",
@@ -113,12 +126,7 @@ async def handle_webhook(request: Request):
         signals = load_signals()
         signals.append(signal_entry)
         save_signals(signals)
-        return {"status": "success", "message": "Cancellation signal queued for MT5", "signal_id": signal_entry["id"]}
-
-    symbol = data.get("symbol", "").replace("/", "").replace("PERP", "").replace(".P", "")
-    limit_price = float(data.get("limit_price", data.get("price", 0)))
-    stop_loss = float(data.get("stop_loss", 0))
-    take_profit = float(data.get("take_profit", 0))
+        return {"status": "success", "message": "Cancellation signal queued", "signal_id": signal_entry["id"]}
 
     if not symbol or action not in ["BUY", "SELL"] or limit_price <= 0:
         raise HTTPException(status_code=400, detail="Invalid trade parameters in payload")
@@ -138,14 +146,18 @@ async def handle_webhook(request: Request):
     signals.append(signal_entry)
     save_signals(signals)
 
-    logging.info(f"✅ Webhook Signal Received & Queued for MT5: {action} {symbol} @ {limit_price}")
+    # Forward Signal Alert to Telegram
+    telegram.send_signal_alert(symbol=symbol, action=action, price=limit_price, stop_loss=stop_loss, take_profit=take_profit)
+
+    logging.info(f"✅ Webhook Signal Received & Sent to Telegram: {action} {symbol} @ {limit_price}")
 
     return {
         "status": "success",
-        "message": "Signal queued for MT5 execution",
+        "message": "Signal queued and Telegram alert sent",
         "signal": signal_entry
     }
 
 if __name__ == "__main__":
+
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)

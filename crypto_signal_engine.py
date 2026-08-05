@@ -1,6 +1,10 @@
 import numpy as np
 import pandas as pd
 from typing import Dict, Any, Optional
+from liquidity_sweep_engine import LiquiditySweepSignalEngine
+from fvg_pullback_engine import FVGPullbackSignalEngine
+
+
 
 class CryptoTrendSignalEngine:
     """
@@ -100,6 +104,8 @@ class CryptoTrendSignalEngine:
 
         return df
 
-# Aliases for backwards compatibility
-CryptoBreakoutSignalEngine = CryptoTrendSignalEngine
-CryptoSupertrendSignalEngine = CryptoTrendSignalEngine
+# Default Engine Aliases (Strategy 1 Liquidity Sweep & MSS is the Primary Engine)
+CryptoSignalEngine = LiquiditySweepSignalEngine
+CryptoBreakoutSignalEngine = LiquiditySweepSignalEngine
+CryptoSupertrendSignalEngine = LiquiditySweepSignalEngine
+

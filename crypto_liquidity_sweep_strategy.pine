@@ -1,0 +1,200 @@
+//@version=6
+strategy("Liquidity Sweep & Market Structure Shift Strategy [vibe-trading v3]", overlay=true, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, commission_type=strategy.commission.percent, commission_value=0.05, slippage=5)
+
+// ==========================================
+// 1. INPUT PARAMETERS
+// ==========================================
+swingWindow   = input.int(48, "Swing High/Low Lookback Window (Bars)", minval=5, group="1. Strategy Engine", tooltip="48 bars on 1H timeframe = 48-hour rolling liquidity high/low")
+atrPeriod     = input.int(14, "ATR Period", minval=1, group="1. Strategy Engine")
+slBufferAtr   = input.float(1.5, "Stop Loss Buffer (ATR Mult)", step=0.1, group="1. Strategy Engine", tooltip="1.5 ATR buffer prevents premature micro-wick stop-outs")
+tpRrRatio     = input.float(2.5, "Take Profit Target (RR Ratio)", step=0.1, group="1. Strategy Engine")
+
+// 4H Macro Trend Filter
+useHtfFilter  = input.bool(true, "Enable 4H HTF Macro Trend Filter", group="2. Macro Trend Filter")
+htfRes        = input.timeframe("240", "HTF Timeframe (4H)", group="2. Macro Trend Filter")
+htfEmaPeriod  = input.int(50, "HTF Trend EMA Period", group="2. Macro Trend Filter")
+
+// Volume & Structure Filters
+useVolFilter  = input.bool(true, "Enable Volume Spike Absorption Filter", group="3. Filters")
+volSmaPeriod  = input.int(20, "Volume SMA Period", group="3. Filters")
+volMult       = input.float(1.05, "Volume Spike Multiplier", step=0.05, group="3. Filters")
+
+useRsiFilter  = input.bool(true, "Enable RSI Rebound Filter", group="3. Filters")
+rsiPeriod     = input.int(14, "RSI Period", group="3. Filters")
+rsiOversold   = input.float(45.0, "RSI Oversold Level", group="3. Filters")
+rsiOverbought = input.float(55.0, "RSI Overbought Level", group="3. Filters")
+
+useMssFilter  = input.bool(true, "Enable Reversal Wick / Structure Shift Filter", group="3. Filters")
+
+// Automated Breakeven Stop Loss
+useBreakeven  = input.bool(true, "Enable Automated Breakeven Stop", group="4. Automated Breakeven Stop", tooltip="Automatically shifts SL to Entry + Buffer once price reaches 1:1 RR")
+beTriggerRr   = input.float(1.0, "Breakeven Trigger Target (RR Ratio)", step=0.1, group="4. Automated Breakeven Stop")
+beOffsetAtr   = input.float(0.1, "Breakeven Lock-in Profit (ATR Mult / Pips)", step=0.05, group="4. Automated Breakeven Stop")
+
+// Webhook & Alert Settings
+webhookPass   = input.string("MY_SECRET_PASSCODE", "Webhook Passcode", group="5. Alert & Webhook Settings")
+
+// UI Settings
+showDashboard = input.bool(true, "Show Signal Box Dashboard", group="UI Settings")
+dashPosition  = input.string(position.top_right, "Dashboard Position", options=[position.top_right, position.bottom_right, position.top_left, position.bottom_left], group="UI Settings")
+
+// ==========================================
+// 2. INDICATOR & TREND CALCULATIONS
+// ==========================================
+atrVal = ta.atr(atrPeriod)
+rsiVal = ta.rsi(close, rsiPeriod)
+volSma = ta.sma(volume, volSmaPeriod)
+
+// Rolling Swing High and Swing Low (excluding current bar)
+swingHigh = ta.highest(high, swingWindow)[1]
+swingLow  = ta.lowest(low, swingWindow)[1]
+
+// 4H HTF Macro Trend (50 EMA)
+htfClose = request.security(syminfo.tickerid, htfRes, close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+htfEma   = request.security(syminfo.tickerid, htfRes, ta.ema(close, htfEmaPeriod), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+macroLong  = not useHtfFilter or (htfClose >= htfEma)
+macroShort = not useHtfFilter or (htfClose < htfEma)
+
+// Confluence Checks
+volOk = not useVolFilter or (volume >= volSma * volMult)
+
+rsiBullOk = not useRsiFilter or (rsiVal <= rsiOversold or close > open)
+rsiBearOk = not useRsiFilter or (rsiVal >= rsiOverbought or close < open)
+
+candleRange = math.max(high - low, 0.00001)
+mssLongOk  = not useMssFilter or ((close - low) / candleRange >= 0.5 or close > open)
+mssBearOk  = not useMssFilter or ((high - close) / candleRange >= 0.5 or close < open)
+
+// Signal Triggers
+// Bullish Liquidity Sweep: Low pierces rolling swing low, but close rebounds back inside
+isBullishSweep = (low < swingLow) and (close > swingLow) and macroLong and volOk and rsiBullOk and mssLongOk
+
+// Bearish Liquidity Sweep: High pierces rolling swing high, but close drops back inside
+isBearishSweep = (high > swingHigh) and (close < swingHigh) and macroShort and volOk and rsiBearOk and mssBearOk
+
+// ==========================================
+// 3. EXECUTION ENGINE & DYNAMIC RISK MANAGEMENT
+// ==========================================
+var float openPrice   = na
+var float initialSL   = na
+var float activeSL    = na
+var float activeTP    = na
+var float initialRisk = na
+var bool  isBeShifted = false
+
+inLong  = strategy.position_size > 0
+inShort = strategy.position_size < 0
+
+// Reset state when flat
+if strategy.position_size == 0
+    openPrice   := na
+    initialSL   := na
+    activeSL    := na
+    activeTP    := na
+    initialRisk := na
+    isBeShifted := false
+
+// Long Entry
+if isBullishSweep and not inLong and not inShort
+    openPrice   := close
+    initialSL   := math.min(low, swingLow) - (slBufferAtr * atrVal)
+    initialRisk := openPrice - initialSL
+    if initialRisk > 0
+        activeSL := initialSL
+        activeTP := openPrice + (initialRisk * tpRrRatio)
+        isBeShifted := false
+        strategy.entry("Long Sweep", strategy.long)
+        
+        // Trigger Webhook Alert
+        string msg = '{"passcode": "' + webhookPass + '", "action": "BUY", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + ', "stop_loss": ' + str.tostring(activeSL) + ', "take_profit": ' + str.tostring(activeTP) + '}'
+        alert(msg, alert.freq_once_per_bar_close)
+
+// Short Entry
+if isBearishSweep and not inLong and not inShort
+    openPrice   := close
+    initialSL   := math.max(high, swingHigh) + (slBufferAtr * atrVal)
+    initialRisk := initialSL - openPrice
+    if initialRisk > 0
+        activeSL := initialSL
+        activeTP := openPrice - (initialRisk * tpRrRatio)
+        isBeShifted := false
+        strategy.entry("Short Sweep", strategy.short)
+        
+        // Trigger Webhook Alert
+        string msg = '{"passcode": "' + webhookPass + '", "action": "SELL", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + ', "stop_loss": ' + str.tostring(activeSL) + ', "take_profit": ' + str.tostring(activeTP) + '}'
+        alert(msg, alert.freq_once_per_bar_close)
+
+// Position Management: Automated Breakeven Shift
+if inLong
+    if useBreakeven and not na(openPrice) and not na(initialRisk)
+        if high >= (openPrice + initialRisk * beTriggerRr)
+            float newSL = openPrice + (beOffsetAtr * atrVal)
+            if newSL > activeSL
+                activeSL := newSL
+                isBeShifted := true
+
+    strategy.exit("Exit Long Sweep", "Long Sweep", stop=activeSL, limit=activeTP)
+
+if inShort
+    if useBreakeven and not na(openPrice) and not na(initialRisk)
+        if low <= (openPrice - initialRisk * beTriggerRr)
+            float newSL = openPrice - (beOffsetAtr * atrVal)
+            if newSL < activeSL
+                activeSL := newSL
+                isBeShifted := true
+
+    strategy.exit("Exit Short Sweep", "Short Sweep", stop=activeSL, limit=activeTP)
+
+// ==========================================
+// 4. VISUAL PLOTS & ALERT CONDITIONS
+// ==========================================
+plot(swingHigh, "48h Swing High", color=color.new(color.red, 30), linewidth=1, style=plot.style_stepline)
+plot(swingLow, "48h Swing Low", color=color.new(color.green, 30), linewidth=1, style=plot.style_stepline)
+
+plot(inLong ? activeSL : na, "Active Long SL", color=isBeShifted ? color.blue : color.red, linewidth=2, style=plot.style_linebr)
+plot(inShort ? activeSL : na, "Active Short SL", color=isBeShifted ? color.blue : color.red, linewidth=2, style=plot.style_linebr)
+plot(inLong ? activeTP : na, "Active Long TP", color=color.green, linewidth=2, style=plot.style_linebr)
+plot(inShort ? activeTP : na, "Active Short TP", color=color.green, linewidth=2, style=plot.style_linebr)
+
+plotshape(isBullishSweep and strategy.position_size == 0, "Bullish Sweep Signal", shape.triangleup, location.belowbar, color.green, size=size.normal, text="SWEEP LONG")
+plotshape(isBearishSweep and strategy.position_size == 0, "Bearish Sweep Signal", shape.triangledown, location.abovebar, color.red, size=size.normal, text="SWEEP SHORT")
+
+// TradingView Alert Conditions (for manual alert setup menu)
+alertcondition(isBullishSweep and strategy.position_size == 0, title="Bullish Sweep Long", message="SWEEP LONG BUY SIGNAL")
+alertcondition(isBearishSweep and strategy.position_size == 0, title="Bearish Sweep Short", message="SWEEP SHORT SELL SIGNAL")
+
+// ==========================================
+// 5. ON-CHART SIGNAL BOX DASHBOARD TABLE (PERSISTENT FIX)
+// ==========================================
+var table dashTable = table.new(dashPosition, 2, 6, bgcolor=color.new(#131722, 10), border_color=color.new(color.gray, 30), border_width=1)
+
+if showDashboard
+    // Header
+    table.cell(dashTable, 0, 0, "LIQUIDITY SWEEP & MSS ENGINE v3", bgcolor=color.new(#1e222d, 0), text_color=color.white, text_size=size.small)
+    table.cell(dashTable, 1, 0, "", bgcolor=color.new(#1e222d, 0))
+    table.merge_cells(dashTable, 0, 0, 1, 0)
+    
+    // Row 1: 4H Macro Bias
+    string htfTxt = htfClose >= htfEma ? "BULLISH (4H 50 EMA) 🟢" : "BEARISH (4H 50 EMA) 🔴"
+    color htfBg   = htfClose >= htfEma ? color.new(color.green, 20) : color.new(color.red, 20)
+    table.cell(dashTable, 0, 1, "4H Macro Bias", text_color=color.white, text_size=size.small)
+    table.cell(dashTable, 1, 1, htfTxt, bgcolor=htfBg, text_color=color.white, text_size=size.small)
+
+    // Row 2: 48h Swing High/Low
+    table.cell(dashTable, 0, 2, "48h Range High / Low", text_color=color.white, text_size=size.small)
+    table.cell(dashTable, 1, 2, "$" + str.tostring(swingHigh, "#.##") + " / $" + str.tostring(swingLow, "#.##"), text_color=color.white, text_size=size.small)
+
+    // Row 3: Position State
+    string posTxt = inLong ? (isBeShifted ? "LONG (BREAKEVEN 🛡️)" : "IN LONG POSITION") : inShort ? (isBeShifted ? "SHORT (BREAKEVEN 🛡️)" : "IN SHORT POSITION") : "SEARCHING FOR SWEEP"
+    color posBg   = isBeShifted ? color.new(color.blue, 30) : inLong ? color.new(color.green, 30) : inShort ? color.new(color.red, 30) : color.new(color.gray, 60)
+    table.cell(dashTable, 0, 3, "Position State", text_color=color.white, text_size=size.small)
+    table.cell(dashTable, 1, 3, posTxt, bgcolor=posBg, text_color=color.white, text_size=size.small)
+    
+    // Row 4: Active Stop Loss
+    table.cell(dashTable, 0, 4, "Active Stop Loss", text_color=color.white, text_size=size.small)
+    table.cell(dashTable, 1, 4, na(activeSL) ? "-" : "$" + str.tostring(activeSL, "#.##") + (isBeShifted ? " (BE)" : ""), text_color=isBeShifted ? color.blue : color.red, text_size=size.small)
+    
+    // Row 5: Target Take Profit
+    table.cell(dashTable, 0, 5, "Take Profit (1:2.5 RR)", text_color=color.white, text_size=size.small)
+    table.cell(dashTable, 1, 5, na(activeTP) ? "-" : "$" + str.tostring(activeTP, "#.##"), text_color=color.green, text_size=size.small)
