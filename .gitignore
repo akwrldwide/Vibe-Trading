@@ -92,3 +92,8 @@ AGENTS.md
 wiki/alpha-library/manifest.json
 wiki/alpha-library/content/
 bench_report.json
+
+# Local scratch and log files
+scratch/
+*_log.json
+*_trades.json

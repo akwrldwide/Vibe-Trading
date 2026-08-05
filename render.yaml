@@ -1,15 +1,17 @@
 services:
   - type: web
-    name: vibe-trading-alpaca-bridge
+    name: vibe-trading-fxopen-bridge
     env: python
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "uvicorn alpaca_bridge:app --host 0.0.0.0 --port $PORT"
+    startCommand: "uvicorn fxopen_bridge:app --host 0.0.0.0 --port $PORT"
     envVars:
-      - key: ALPACA_API_KEY
-        sync: false
-      - key: ALPACA_SECRET_KEY
-        sync: false
-      - key: ALPACA_BASE_URL
-        value: https://paper-api.alpaca.markets
       - key: WEBHOOK_PASSCODE
-        sync: false
+        value: MY_SECRET_PASSCODE
+      - key: FXOPEN_API_URL
+        value: https://demo.forex.game/api/v1
+      - key: FXOPEN_API_KEY
+        value: YOUR_FXOPEN_API_KEY_HERE
+      - key: FXOPEN_SECRET_KEY
+        value: YOUR_FXOPEN_SECRET_KEY_HERE
+      - key: PORT
+        value: 8000

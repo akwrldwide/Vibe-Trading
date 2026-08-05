@@ -1,18 +1,23 @@
 import os
 import json
+import logging
+from datetime import datetime
 import requests
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 import uvicorn
 from dotenv import load_dotenv
 
 load_dotenv()
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
 ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 WEBHOOK_PASSCODE = os.getenv("WEBHOOK_PASSCODE", "MY_SECRET_PASSCODE")
+LOG_FILE = "paper_trades_log.json"
 
-app = FastAPI(title="9:30 NY ICT Strategy - Alpaca Paper Trading Webhook Bridge")
+app = FastAPI(title="9:30 NY ICT Strategy - Webhook & Paper Trading Bridge")
 
 def get_alpaca_headers():
     return {
@@ -21,43 +26,40 @@ def get_alpaca_headers():
         "Content-Type": "application/json"
     }
 
+def record_local_paper_trade(trade_data: dict):
+    trades = []
+    if os.path.exists(LOG_FILE):
+        try:
+            with open(LOG_FILE, "r") as f:
+                trades = json.load(f)
+        except Exception:
+            trades = []
+
+    trade_data["timestamp"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    trades.append(trade_data)
+
+    with open(LOG_FILE, "w") as f:
+        json.dump(trades, f, indent=2)
+
 @app.get("/")
 def read_root():
-    return {"status": "online", "message": "Alpaca Paper Trading Webhook Bridge Active"}
+    return {"status": "online", "message": "Paper Trading Webhook Bridge Active"}
 
 @app.get("/health")
 def health_check():
     """Health check endpoint to keep Render web service awake during trading hours"""
     return {"status": "healthy", "service": "alpaca-bridge"}
 
-@app.post("/webhook")
-async def handle_webhook(request: Request):
-    try:
-        data = await request.json()
-    except Exception:
-        body_bytes = await request.body()
-        try:
-            data = json.loads(body_bytes.decode())
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid JSON payload: {e}")
+@app.get("/trades")
+def get_recorded_trades():
+    """Endpoint to inspect recorded paper trades & Alpaca response logs"""
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE, "r") as f:
+            return json.load(f)
+    return []
 
-    # Passcode Authentication
-    passcode = data.get("passcode")
-    if passcode != os.getenv("WEBHOOK_PASSCODE", WEBHOOK_PASSCODE):
-        raise HTTPException(status_code=401, detail="Unauthorized: Passcode mismatch")
-
-    symbol = data.get("symbol", "").replace("/", "") # Format e.g. EURUSD
-    action = data.get("action", "").upper()
-    limit_price = float(data.get("limit_price", 0))
-    stop_loss = float(data.get("stop_loss", 0))
-    take_profit = float(data.get("take_profit", 0))
-
-    if not symbol or action not in ["BUY", "SELL"] or limit_price <= 0:
-        raise HTTPException(status_code=400, detail="Invalid trade parameters")
-
+def execute_alpaca_trade(symbol: str, action: str, limit_price: float, stop_loss: float, take_profit: float):
     order_side = "buy" if action == "BUY" else "sell"
-
-    # Construct Alpaca Bracket Limit Order Payload
     order_payload = {
         "symbol": symbol,
         "qty": 1,
@@ -73,29 +75,93 @@ async def handle_webhook(request: Request):
             "stop_price": str(stop_loss)
         }
     }
-
     url = f"{os.getenv('ALPACA_BASE_URL', ALPACA_BASE_URL)}/v2/orders"
-    res = requests.post(url, json=order_payload, headers=get_alpaca_headers())
+    
+    trade_record = {
+        "symbol": symbol,
+        "action": action,
+        "limit_price": limit_price,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "alpaca_submitted": False
+    }
 
-    if res.status_code not in [200, 201]:
-        return {"status": "error", "alpaca_response": res.json()}
+    try:
+        res = requests.post(url, json=order_payload, headers=get_alpaca_headers(), timeout=10)
+        logging.info(f"Alpaca Order Response [{res.status_code}]: {res.text}")
+        
+        if res.status_code in [200, 201]:
+            trade_record["alpaca_submitted"] = True
+            trade_record["alpaca_order_id"] = res.json().get("id")
+            trade_record["status"] = "SUBMITTED_TO_ALPACA"
+        else:
+            trade_record["status"] = "REJECTED_BY_ALPACA"
+            trade_record["error"] = res.json() if res.content else res.text
+            logging.warning(f"⚠️ Alpaca Order Rejected for {symbol}: {res.text}")
 
-    order_data = res.json()
+    except Exception as e:
+        logging.error(f"Error submitting order to Alpaca: {e}")
+        trade_record["status"] = "ERROR"
+        trade_record["error"] = str(e)
+
+    record_local_paper_trade(trade_record)
+
+def execute_alpaca_cancel():
+    url = f"{os.getenv('ALPACA_BASE_URL', ALPACA_BASE_URL)}/v2/orders"
+    try:
+        res = requests.delete(url, headers=get_alpaca_headers(), timeout=10)
+        logging.info(f"Alpaca Cancel All Response [{res.status_code}]: {res.text}")
+        record_local_paper_trade({"action": "CANCEL_ALL", "response": res.json() if res.content else {}})
+    except Exception as e:
+        logging.error(f"Error canceling orders on Alpaca: {e}")
+
+@app.post("/webhook")
+async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
+    try:
+        data = await request.json()
+    except Exception:
+        body_bytes = await request.body()
+        try:
+            data = json.loads(body_bytes.decode())
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON payload: {e}")
+
+    logging.info(f"Received Webhook Payload: {data}")
+
+    # Passcode Authentication
+    passcode = data.get("passcode")
+    if passcode != os.getenv("WEBHOOK_PASSCODE", WEBHOOK_PASSCODE):
+        raise HTTPException(status_code=401, detail="Unauthorized: Passcode mismatch")
+
+    action = data.get("action", "").upper()
+
+    if action == "CANCEL":
+        background_tasks.add_task(execute_alpaca_cancel)
+        return {"status": "accepted", "action": "CANCEL", "message": "Cancellation request queued"}
+
+    symbol = data.get("symbol", "").replace("/", "") # Format e.g. EURUSD
+    limit_price = float(data.get("limit_price", 0))
+    stop_loss = float(data.get("stop_loss", 0))
+    take_profit = float(data.get("take_profit", 0))
+
+    if not symbol or action not in ["BUY", "SELL"] or limit_price <= 0:
+        raise HTTPException(status_code=400, detail="Invalid trade parameters")
+
+    # Queue execution in background task for fast instant HTTP 200 response to TradingView
+    background_tasks.add_task(execute_alpaca_trade, symbol, action, limit_price, stop_loss, take_profit)
 
     return {
         "status": "success",
         "action": action,
         "symbol": symbol,
-        "order_id": order_data.get("id"),
-        "alpaca_response": order_data
+        "message": "Trade payload accepted and queued"
     }
 
 @app.post("/cancel_all")
 def cancel_all_orders():
-    """Safety Guard: Cancel all pending unfilled orders (used for 11:00 AM NY killzone & TP-touch)"""
-    url = f"{os.getenv('ALPACA_BASE_URL', ALPACA_BASE_URL)}/v2/orders"
-    res = requests.delete(url, headers=get_alpaca_headers())
-    return {"status": "success", "message": "All open orders canceled", "response": res.json()}
+    """Safety Guard: Cancel all pending unfilled orders"""
+    execute_alpaca_cancel()
+    return {"status": "success", "message": "All open orders canceled"}
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))

@@ -13,6 +13,7 @@ class NYOpenICTSignalEngine:
         self.htf_ema_period = int(self.config.get("htf_ema_period", 50))
         self.sl_mode = self.config.get("sl_mode", "fvg_struct") # 'fvg_struct' or 'session_peak'
         self.sl_buffer_pips = float(self.config.get("sl_buffer_pips", 2.0))
+        self.use_htf_filter = bool(self.config.get("use_htf_filter", True))
         
     def generate_signals(self, df_1m: pd.DataFrame) -> pd.DataFrame:
         df = df_1m.copy()
@@ -55,9 +56,6 @@ class NYOpenICTSignalEngine:
         news_guard = ~((df["time"] >= pd.to_datetime("09:55").time()) & (df["time"] <= pd.to_datetime("10:05").time()))
         valid_time = trade_window & news_guard
         
-        breakout_up = (df["close"] > df["or_high"]) & (df["close"].shift(1) <= df["or_high"])
-        breakout_down = (df["close"] < df["or_low"]) & (df["close"].shift(1) >= df["or_low"])
-        
         signals = np.zeros(len(df))
         entry_prices = np.full(len(df), np.nan)
         stop_losses = np.full(len(df), np.nan)
@@ -65,12 +63,25 @@ class NYOpenICTSignalEngine:
         
         buffer_val = self.sl_buffer_pips * 0.0001
         
+        current_date = None
+        session_trade_taken = False
+        
         for i in range(3, len(df)):
-            if not valid_time.iloc[i]:
+            date_i = df["date"].iloc[i]
+            if date_i != current_date:
+                current_date = date_i
+                session_trade_taken = False
+                
+            if not valid_time.iloc[i] or session_trade_taken:
                 continue
                 
             # Long Setup
-            if (breakout_up.iloc[i] or breakout_up.iloc[i-1] or breakout_up.iloc[i-2]) and df["fvg_bullish"].iloc[i]:
+            is_above_or = df["close"].iloc[i] > df["or_high"].iloc[i]
+            is_below_or = df["close"].iloc[i] < df["or_low"].iloc[i]
+            htf_ok_long = (not self.use_htf_filter) or (df["htf_bias"].iloc[i] == 1)
+            htf_ok_short = (not self.use_htf_filter) or (df["htf_bias"].iloc[i] == -1)
+            
+            if is_above_or and df["fvg_bullish"].iloc[i] and htf_ok_long:
                 entry = df["fvg_bullish_ce"].iloc[i]
                 struct_low = min(df["low"].iloc[i], df["low"].iloc[i-1], df["low"].iloc[i-2], df["low"].iloc[i-3])
                 sl = struct_low - buffer_val
@@ -82,9 +93,10 @@ class NYOpenICTSignalEngine:
                     entry_prices[i] = entry
                     stop_losses[i] = sl
                     take_profits[i] = tp
+                    session_trade_taken = True
                     
             # Short Setup
-            elif (breakout_down.iloc[i] or breakout_down.iloc[i-1] or breakout_down.iloc[i-2]) and df["fvg_bearish"].iloc[i]:
+            elif is_below_or and df["fvg_bearish"].iloc[i] and htf_ok_short:
                 entry = df["fvg_bearish_ce"].iloc[i]
                 struct_high = max(df["high"].iloc[i], df["high"].iloc[i-1], df["high"].iloc[i-2], df["high"].iloc[i-3])
                 sl = struct_high + buffer_val
@@ -96,6 +108,7 @@ class NYOpenICTSignalEngine:
                     entry_prices[i] = entry
                     stop_losses[i] = sl
                     take_profits[i] = tp
+                    session_trade_taken = True
                     
         df["signal"] = signals
         df["entry_price"] = entry_prices

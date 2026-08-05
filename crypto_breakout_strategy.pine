@@ -1,0 +1,163 @@
+//@version=6
+strategy("Crypto Trend & Momentum Strategy v4 [Fixed]", overlay=true, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, commission_type=strategy.commission.percent, commission_value=0.05, slippage=5)
+
+// ==========================================
+// 1. INPUT PARAMETERS
+// ==========================================
+fastEmaPeriod = input.int(12, "Fast EMA Period", minval=1, group="1. Strategy Engine")
+slowEmaPeriod = input.int(26, "Slow EMA Period", minval=1, group="1. Strategy Engine")
+atrPeriod     = input.int(14, "ATR Period", minval=1, group="1. Strategy Engine")
+slAtrMult     = input.float(2.0, "Initial Stop Loss (ATR Mult)", step=0.1, group="1. Strategy Engine")
+tpRrRatio     = input.float(2.5, "Take Profit (RR Ratio)", step=0.1, group="1. Strategy Engine")
+
+// 4H Macro Trend Filter
+useHtfFilter  = input.bool(true, "Enable 4H Macro Trend Filter", group="2. Macro Trend Filter")
+htfRes        = input.timeframe("240", "HTF Timeframe (4H)", group="2. Macro Trend Filter")
+htfEmaPeriod  = input.int(200, "HTF Trend EMA Period", group="2. Macro Trend Filter")
+
+// Risk & Trailing Management
+useBreakeven  = input.bool(true, "Enable Dynamic Breakeven Stop", group="3. Risk Management")
+beTriggerRr   = input.float(1.0, "Breakeven Trigger (RR)", step=0.1, group="3. Risk Management")
+useTrailing   = input.bool(true, "Enable Trailing Stop after 1 RR", group="3. Risk Management")
+
+showDashboard = input.bool(true, "Show Signal Box Dashboard", group="UI Settings")
+dashPosition  = input.string(position.top_right, "Dashboard Position", options=[position.top_right, position.bottom_right, position.top_left, position.bottom_left], group="UI Settings")
+
+// ==========================================
+// 2. INDICATOR & TREND CALCULATIONS
+// ==========================================
+atrVal  = ta.atr(atrPeriod)
+emaFast = ta.ema(close, fastEmaPeriod)
+emaSlow = ta.ema(close, slowEmaPeriod)
+
+// 4H Macro Trend (200 EMA)
+htfClose = request.security(syminfo.tickerid, htfRes, close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+htfEma   = request.security(syminfo.tickerid, htfRes, ta.ema(close, htfEmaPeriod), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+macroLong  = not useHtfFilter or (htfClose > htfEma)
+macroShort = not useHtfFilter or (htfClose < htfEma)
+
+// Entry Signal: EMA Fast/Slow Crossover aligned with 4H Macro Trend
+longCondition  = ta.crossover(emaFast, emaSlow) and macroLong
+shortCondition = ta.crossunder(emaFast, emaSlow) and macroShort
+
+// ==========================================
+// 3. EXECUTION ENGINE & RISK MANAGEMENT
+// ==========================================
+var float openPrice   = na
+var float initialSL   = na
+var float activeSL    = na
+var float activeTP    = na
+var float initialRisk = na
+
+inLong  = strategy.position_size > 0
+inShort = strategy.position_size < 0
+
+// Reset state when flat
+if strategy.position_size == 0
+    openPrice   := na
+    initialSL   := na
+    activeSL    := na
+    activeTP    := na
+    initialRisk := na
+
+// Long Entry
+if longCondition and not inLong and not inShort
+    openPrice   := close
+    initialSL   := openPrice - (slAtrMult * atrVal)
+    initialRisk := openPrice - initialSL
+    activeSL    := initialSL
+    activeTP    := openPrice + (initialRisk * tpRrRatio)
+    strategy.entry("Long", strategy.long)
+
+// Short Entry
+if shortCondition and not inLong and not inShort
+    openPrice   := close
+    initialSL   := openPrice + (slAtrMult * atrVal)
+    initialRisk := initialSL - openPrice
+    activeSL    := initialSL
+    activeTP    := openPrice - (initialRisk * tpRrRatio)
+    strategy.entry("Short", strategy.short)
+
+// Position Management (Breakeven & Trailing ONLY AFTER profit is secured)
+if inLong
+    // Dynamic Breakeven Stop
+    if useBreakeven and not na(openPrice) and not na(initialRisk)
+        if high >= (openPrice + initialRisk * beTriggerRr)
+            activeSL := math.max(activeSL, openPrice + (0.1 * atrVal))
+
+    // Trailing Stop (Only trails UP when price advances past 1 RR)
+    if useTrailing and not na(openPrice) and not na(initialRisk)
+        if high >= (openPrice + initialRisk * 1.0)
+            float trailSL = high - (slAtrMult * atrVal)
+            activeSL := math.max(activeSL, trailSL)
+
+    strategy.exit("Exit Long", "Long", stop=activeSL, limit=activeTP)
+
+if inShort
+    // Dynamic Breakeven Stop
+    if useBreakeven and not na(openPrice) and not na(initialRisk)
+        if low <= (openPrice - initialRisk * beTriggerRr)
+            activeSL := math.min(activeSL, openPrice - (0.1 * atrVal))
+
+    // Trailing Stop (Only trails DOWN when price advances past 1 RR)
+    if useTrailing and not na(openPrice) and not na(initialRisk)
+        if low <= (openPrice - initialRisk * 1.0)
+            float trailSL = low + (slAtrMult * atrVal)
+            activeSL := math.min(activeSL, trailSL)
+
+    strategy.exit("Exit Short", "Short", stop=activeSL, limit=activeTP)
+
+// ==========================================
+// 4. VISUAL PLOTS
+// ==========================================
+plot(emaFast, "Fast EMA", color=color.green, linewidth=2)
+plot(emaSlow, "Slow EMA", color=color.orange, linewidth=2)
+
+plot(inLong ? activeSL : na, "Active Long SL", color=color.red, linewidth=2, style=plot.style_linebr)
+plot(inShort ? activeSL : na, "Active Short SL", color=color.red, linewidth=2, style=plot.style_linebr)
+plot(inLong ? activeTP : na, "Active Long TP", color=color.green, linewidth=1, style=plot.style_linebr)
+plot(inShort ? activeTP : na, "Active Short TP", color=color.green, linewidth=1, style=plot.style_linebr)
+
+plotshape(longCondition and strategy.position_size == 0, "Buy Signal", shape.triangleup, location.belowbar, color.green, size=size.small)
+plotshape(shortCondition and strategy.position_size == 0, "Sell Signal", shape.triangledown, location.abovebar, color.red, size=size.small)
+
+// ==========================================
+// 5. ON-CHART SIGNAL BOX DASHBOARD TABLE
+// ==========================================
+var table dashTable = na
+
+if barstate.islast and showDashboard
+    if na(dashTable)
+        dashTable := table.new(dashPosition, 2, 6, bgcolor=color.new(#131722, 10), border_color=color.new(color.gray, 30), border_width=1)
+    
+    // Header
+    table.cell(dashTable, 0, 0, "TREND MOMENTUM ENGINE v4", bgcolor=color.new(#1e222d, 0), text_color=color.white, text_size=size.small)
+    table.cell(dashTable, 1, 0, "", bgcolor=color.new(#1e222d, 0))
+    table.merge_cells(dashTable, 0, 0, 1, 0)
+    
+    // Row 1: 4H Macro Bias
+    string htfTxt = htfClose > htfEma ? "BULLISH (ABOVE 4H 200 EMA) 🟢" : "BEARISH (BELOW 4H 200 EMA) 🔴"
+    color htfBg   = htfClose > htfEma ? color.new(color.green, 20) : color.new(color.red, 20)
+    table.cell(dashTable, 0, 1, "4H Macro Bias", text_color=color.white, text_size=size.small)
+    table.cell(dashTable, 1, 1, htfTxt, bgcolor=htfBg, text_color=color.white, text_size=size.small)
+
+    // Row 2: 1H EMA Alignment
+    string emaTxt = emaFast > emaSlow ? "BULLISH 🟢" : "BEARISH 🔴"
+    color emaBg   = emaFast > emaSlow ? color.new(color.green, 40) : color.new(color.red, 40)
+    table.cell(dashTable, 0, 2, "1H EMA Trend", text_color=color.white, text_size=size.small)
+    table.cell(dashTable, 1, 2, emaTxt, bgcolor=emaBg, text_color=color.white, text_size=size.small)
+
+    // Row 3: Position State
+    string posTxt = inLong ? "IN LONG POSITION" : inShort ? "IN SHORT POSITION" : "SEARCHING / FLAT"
+    color posBg   = inLong ? color.new(color.green, 30) : inShort ? color.new(color.red, 30) : color.new(color.gray, 60)
+    table.cell(dashTable, 0, 3, "Position State", text_color=color.white, text_size=size.small)
+    table.cell(dashTable, 1, 3, posTxt, bgcolor=posBg, text_color=color.white, text_size=size.small)
+    
+    // Row 4: Active Stop Loss
+    table.cell(dashTable, 0, 4, "Active Stop Loss", text_color=color.white, text_size=size.small)
+    table.cell(dashTable, 1, 4, na(activeSL) ? "-" : "$" + str.tostring(activeSL, "#.##"), text_color=color.red, text_size=size.small)
+    
+    // Row 5: Target Take Profit
+    table.cell(dashTable, 0, 5, "Take Profit Target", text_color=color.white, text_size=size.small)
+    table.cell(dashTable, 1, 5, na(activeTP) ? "-" : "$" + str.tostring(activeTP, "#.##"), text_color=color.green, text_size=size.small)

@@ -1,0 +1,318 @@
+//@version=6
+indicator("9:30 NY Open 1m ICT FVG (Alpaca Bugfixed)", overlay=true, max_boxes_count=100, max_lines_count=100, max_labels_count=100, max_bars_back=1000)
+
+// ============================================================================
+// INPUT PARAMETERS
+// ============================================================================
+passcode                 = input.string("MY_SECRET_PASSCODE", "Webhook Passcode", group="Webhook Settings")
+use_htf_filter           = input.bool(true, "Use 1H HTF Trend Filter", group="Strategy Parameters")
+ignore_news_guard        = input.bool(false, "Overlook News Window (09:55-10:05)", group="Strategy Parameters")
+cancel_on_opposite_break = input.bool(true, "Cancel Pending Order on Opposite OR Break", group="Strategy Parameters")
+sl_mode                  = input.string("3-Bar FVG Swing Low/High", "Stop Loss Mode", options=["3-Bar FVG Swing Low/High", "4-Bar Swing Low/High", "FVG Gap Edge", "Fixed Pips"], group="Strategy Parameters")
+fixed_sl_pips            = input.float(3.0, "Fixed SL Pips (if Fixed Pips selected)", minval=1.0, step=0.5, group="Strategy Parameters")
+rr_ratio                 = input.float(2.0, "Risk:Reward Ratio", minval=0.5, step=0.5, group="Strategy Parameters")
+htf_ema_period           = input.int(50, "1H HTF EMA Period", minval=10, group="Strategy Parameters")
+sl_buffer_val            = input.float(1.0, "SL Buffer (Pips/Points)", minval=0.0, step=0.5, group="Strategy Parameters")
+min_fvg_val              = input.float(0.3, "Min FVG Size (Pips/Points)", minval=0.0, step=0.1, group="Strategy Parameters")
+box_width_bars           = input.int(30, "Signal Box Width (Bars)", minval=10, maxval=100, group="Visuals")
+show_htf_ema             = input.bool(true, "Show 1H HTF EMA Line", group="Visuals")
+show_trade_levels        = input.bool(true, "Show Entry / SL / TP Chart Lines & Labels", group="Visuals")
+show_table               = input.bool(true, "Show Status Table", group="Visuals")
+table_pos                = input.string("Top Right", "Table Position", options=["Top Right", "Bottom Right", "Top Left", "Bottom Left"], group="Visuals")
+
+// ============================================================================
+// TIMEZONE & SESSION DEFINITIONS (NY EST/EDT)
+// ============================================================================
+ny_hour   = hour(time, "America/New_York")
+ny_minute = minute(time, "America/New_York")
+ny_time   = ny_hour * 100 + ny_minute
+
+// Session Flags
+is_or_window     = ny_time >= 0930 and ny_time < 0945  // 09:30 - 09:45 AM NY Opening Range
+is_trade_window  = ny_time >= 0945 and ny_time <= 1130 // 09:45 - 11:30 AM NY Trade Window
+is_news_guard    = ny_time >= 0955 and ny_time <= 1005 // 09:55 - 10:05 AM News Guard
+is_valid_time    = is_trade_window and (ignore_news_guard or not is_news_guard)
+is_full_session  = ny_time >= 0930 and ny_time <= 1130 // 09:30 - 11:30 AM Full Display Session
+
+// Detect new day in NY timezone
+ny_day_ts      = time("D", "America/New_York")
+ny_day_change  = ta.change(ny_day_ts)
+is_new_day     = not na(ny_day_change) and ny_day_change != 0
+
+// ============================================================================
+// 15-MINUTE OPENING RANGE CALCULATION (09:30 - 09:45 AM)
+// ============================================================================
+var float or_high = na
+var float or_low  = na
+var bool session_trade_taken = false
+var bool pending_order_active = false
+var bool trade_completed = false
+var int current_signal = 0 // 1 = Buy, -1 = Sell, 0 = None
+
+if is_new_day
+    or_high := na
+    or_low  := na
+    session_trade_taken := false
+    pending_order_active := false
+    trade_completed := false
+    current_signal := 0
+
+if is_or_window
+    if na(or_high) or high > or_high
+        or_high := high
+    if na(or_low) or low < or_low
+        or_low := low
+
+// ============================================================================
+// 1H HTF EMA TREND BIAS & PLOT
+// ============================================================================
+ema50 = ta.ema(close, htf_ema_period)
+htf_close = request.security(syminfo.tickerid, "60", close, barmerge.gaps_off, barmerge.lookahead_off)
+htf_ema   = request.security(syminfo.tickerid, "60", ema50, barmerge.gaps_off, barmerge.lookahead_off)
+is_htf_bullish = htf_close > htf_ema
+is_htf_bearish = htf_close < htf_ema
+
+// Visible 1H HTF EMA Plot line
+plot(show_htf_ema ? htf_ema : na, "1H HTF EMA Line", color=color.orange, linewidth=2)
+
+// ============================================================================
+// 1m FAIR VALUE GAP (FVG) DETECTION
+// ============================================================================
+unit_size = syminfo.type == "forex" ? syminfo.mintick * 10.0 : 1.0
+buffer_val = sl_buffer_val * unit_size
+min_fvg_threshold = min_fvg_val * unit_size
+
+// Bullish FVG
+fvg_bullish_gap = low - high[2]
+is_fvg_bullish = (low > high[2]) and (fvg_bullish_gap >= min_fvg_threshold)
+fvg_bullish_top = low
+fvg_bullish_bottom = high[2]
+fvg_bullish_ce = (high[2] + low) / 2.0
+
+// Bearish FVG
+fvg_bearish_gap = low[2] - high
+is_fvg_bearish = (high < low[2]) and (fvg_bearish_gap >= min_fvg_threshold)
+fvg_bearish_top = low[2]
+fvg_bearish_bottom = high
+fvg_bearish_ce = (low[2] + high) / 2.0
+
+// ============================================================================
+// BREAKOUT & SIGNAL EXECUTION LOGIC (SINGLE TRADE PER SESSION)
+// ============================================================================
+is_above_or = not na(or_high) and close > or_high
+is_below_or = not na(or_low) and close < or_low
+
+long_htf_ok  = not use_htf_filter or is_htf_bullish
+short_htf_ok = not use_htf_filter or is_htf_bearish
+
+var float signal_entry     = na
+var float signal_sl        = na
+var float signal_tp        = na
+
+buy_signal    = false
+sell_signal   = false
+cancel_signal = false
+tp_hit_signal = false
+
+// Track trade progression (TP/SL Hit) to deactivate pending status and prevent unwanted X icon
+if pending_order_active and not trade_completed
+    if current_signal == 1
+        if high >= signal_tp
+            trade_completed := true
+            pending_order_active := false
+            tp_hit_signal := true
+        else if low <= signal_sl
+            trade_completed := true
+            pending_order_active := false
+    else if current_signal == -1
+        if low <= signal_tp
+            trade_completed := true
+            pending_order_active := false
+            tp_hit_signal := true
+        else if high >= signal_sl
+            trade_completed := true
+            pending_order_active := false
+
+// Check opposite OR breach cancellation ONLY if trade was NOT completed (TP/SL not hit)
+if pending_order_active and not trade_completed and cancel_on_opposite_break
+    if current_signal == 1 and is_below_or
+        cancel_signal := true
+        pending_order_active := false
+        trade_completed := true
+        cancel_json = '{"passcode": "' + passcode + '", "symbol": "' + syminfo.ticker + '", "action": "CANCEL", "reason": "Opposite OR Low breached"}'
+        alert(cancel_json, alert.freq_once_per_bar_close)
+    else if current_signal == -1 and is_above_or
+        cancel_signal := true
+        pending_order_active := false
+        trade_completed := true
+        cancel_json = '{"passcode": "' + passcode + '", "symbol": "' + syminfo.ticker + '", "action": "CANCEL", "reason": "Opposite OR High breached"}'
+        alert(cancel_json, alert.freq_once_per_bar_close)
+
+if is_valid_time and not session_trade_taken
+    // Bullish Long Signal
+    if is_above_or and is_fvg_bullish and long_htf_ok
+        entry = fvg_bullish_ce
+        
+        // SL calculation based on sl_mode
+        float sl = na
+        if sl_mode == "3-Bar FVG Swing Low/High"
+            struct_low = math.min(low, low[1], low[2])
+            sl := struct_low - buffer_val
+        else if sl_mode == "4-Bar Swing Low/High"
+            struct_low = math.min(low, low[1], low[2], low[3])
+            sl := struct_low - buffer_val
+        else if sl_mode == "FVG Gap Edge"
+            sl := fvg_bullish_bottom - buffer_val
+        else // Fixed Pips
+            sl := entry - (fixed_sl_pips * unit_size)
+
+        risk = entry - sl
+        if risk > 0
+            tp = entry + (risk * rr_ratio)
+            buy_signal := true
+            current_signal := 1
+            signal_entry := entry
+            signal_sl    := sl
+            signal_tp    := tp
+            session_trade_taken := true
+            pending_order_active := true
+            trade_completed := false
+            
+            // Draw Signal FVG Box
+            box.new(left=bar_index-2, top=fvg_bullish_top, right=bar_index+box_width_bars, bottom=fvg_bullish_bottom, 
+                    border_color=color.purple, border_width=2, bgcolor=color.new(color.purple, 75))
+
+            // Draw Entry, SL, and TP Lines & Labels Directly Anchored to Signal FVG Box
+            if show_trade_levels
+                // Entry Line & Badge
+                line.new(x1=bar_index-2, y1=entry, x2=bar_index+box_width_bars, y2=entry, 
+                         color=color.blue, width=2, style=line.style_solid)
+                label.new(x=bar_index+box_width_bars, y=entry, text="ENTRY: " + str.tostring(entry, "#.#####"), 
+                          color=color.new(color.blue, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
+
+                // Stop Loss Line & Badge
+                line.new(x1=bar_index-2, y1=sl, x2=bar_index+box_width_bars, y2=sl, 
+                         color=color.red, width=2, style=line.style_dashed)
+                label.new(x=bar_index+box_width_bars, y=sl, text="SL: " + str.tostring(sl, "#.#####"), 
+                          color=color.new(color.red, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
+
+                // Take Profit Line & Badge
+                line.new(x1=bar_index-2, y1=tp, x2=bar_index+box_width_bars, y2=tp, 
+                         color=color.green, width=2, style=line.style_dashed)
+                label.new(x=bar_index+box_width_bars, y=tp, text="TP: " + str.tostring(tp, "#.#####"), 
+                          color=color.new(color.green, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
+
+            // Dynamic Webhook Alert
+            buy_json = '{"passcode": "' + passcode + '", "symbol": "' + syminfo.ticker + '", "action": "BUY", "limit_price": ' + str.tostring(entry, "#.#####") + ', "stop_loss": ' + str.tostring(sl, "#.#####") + ', "take_profit": ' + str.tostring(tp, "#.#####") + '}'
+            alert(buy_json, alert.freq_once_per_bar_close)
+
+    // Bearish Short Signal
+    else if is_below_or and is_fvg_bearish and short_htf_ok
+        entry = fvg_bearish_ce
+        
+        // SL calculation based on sl_mode
+        float sl = na
+        if sl_mode == "3-Bar FVG Swing Low/High"
+            struct_high = math.max(high, high[1], high[2])
+            sl := struct_high + buffer_val
+        else if sl_mode == "4-Bar Swing Low/High"
+            struct_high = math.max(high, high[1], high[2], high[3])
+            sl := struct_high + buffer_val
+        else if sl_mode == "FVG Gap Edge"
+            sl := fvg_bearish_top + buffer_val
+        else // Fixed Pips
+            sl := entry + (fixed_sl_pips * unit_size)
+
+        risk = sl - entry
+        if risk > 0
+            tp = entry - (risk * rr_ratio)
+            sell_signal := true
+            current_signal := -1
+            signal_entry := entry
+            signal_sl    := sl
+            signal_tp    := tp
+            session_trade_taken := true
+            pending_order_active := true
+            trade_completed := false
+            
+            // Draw Signal FVG Box
+            box.new(left=bar_index-2, top=fvg_bearish_top, right=bar_index+box_width_bars, bottom=fvg_bearish_bottom, 
+                    border_color=color.purple, border_width=2, bgcolor=color.new(color.purple, 75))
+
+            // Draw Entry, SL, and TP Lines & Labels Directly Anchored to Signal FVG Box
+            if show_trade_levels
+                // Entry Line & Badge
+                line.new(x1=bar_index-2, y1=entry, x2=bar_index+box_width_bars, y2=entry, 
+                         color=color.blue, width=2, style=line.style_solid)
+                label.new(x=bar_index+box_width_bars, y=entry, text="ENTRY: " + str.tostring(entry, "#.#####"), 
+                          color=color.new(color.blue, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
+
+                // Stop Loss Line & Badge
+                line.new(x1=bar_index-2, y1=sl, x2=bar_index+box_width_bars, y2=sl, 
+                         color=color.red, width=2, style=line.style_dashed)
+                label.new(x=bar_index+box_width_bars, y=sl, text="SL: " + str.tostring(sl, "#.#####"), 
+                          color=color.new(color.red, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
+
+                // Take Profit Line & Badge
+                line.new(x1=bar_index-2, y1=tp, x2=bar_index+box_width_bars, y2=tp, 
+                         color=color.green, width=2, style=line.style_dashed)
+                label.new(x=bar_index+box_width_bars, y=tp, text="TP: " + str.tostring(tp, "#.#####"), 
+                          color=color.new(color.green, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
+
+            // Dynamic Webhook Alert
+            sell_json = '{"passcode": "' + passcode + '", "symbol": "' + syminfo.ticker + '", "action": "SELL", "limit_price": ' + str.tostring(entry, "#.#####") + ', "stop_loss": ' + str.tostring(sl, "#.#####") + ', "take_profit": ' + str.tostring(tp, "#.#####") + '}'
+            alert(sell_json, alert.freq_once_per_bar_close)
+
+// ============================================================================
+// VISUAL PLOTS ON CHART
+// ============================================================================
+plot_or_high = is_full_session ? or_high : na
+plot_or_low  = is_full_session ? or_low  : na
+
+plot(plot_or_high, "15m OR High", color=color.green, linewidth=2, style=plot.style_linebr)
+plot(plot_or_low,  "15m OR Low",  color=color.red,   linewidth=2, style=plot.style_linebr)
+
+plotshape(buy_signal, title="BUY Signal Triangle", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small)
+plotshape(sell_signal, title="SELL Signal Triangle", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)
+plotshape(cancel_signal, title="CANCEL Signal", style=shape.xcross, location=location.abovebar, color=color.orange, size=size.small)
+
+// ============================================================================
+// STATUS TABLE OVERLAY
+// ============================================================================
+tbl_pos = switch table_pos
+    "Top Right"    => position.top_right
+    "Bottom Right" => position.bottom_right
+    "Top Left"     => position.top_left
+    => position.bottom_left
+
+var table status_tbl = table.new(tbl_pos, 2, 6, bgcolor=color.new(color.black, 20), border_color=color.gray, border_width=1)
+
+label_cell_bg = color.rgb(50, 50, 50)
+
+if show_table and barstate.islast
+    setup_str = current_signal == 1 ? (trade_completed ? "BUY (DONE)" : "BUY") : current_signal == -1 ? (trade_completed ? "SELL (DONE)" : "SELL") : "NONE"
+    setup_bg  = current_signal == 1 ? color.green : current_signal == -1 ? color.red : color.gray
+
+    table.cell(status_tbl, 0, 0, "9:30 NY ICT SETUP", bgcolor=color.purple, text_color=color.white, text_size=size.small)
+    table.cell(status_tbl, 1, 0, setup_str, bgcolor=setup_bg, text_color=color.white, text_size=size.small)
+
+    table.cell(status_tbl, 0, 1, "1H HTF Bias", bgcolor=label_cell_bg, text_color=color.white, text_size=size.small)
+    htf_bias_text = not use_htf_filter ? (is_htf_bullish ? "BULLISH (OFF)" : "BEARISH (OFF)") : (is_htf_bullish ? "BULLISH" : "BEARISH")
+    table.cell(status_tbl, 1, 1, htf_bias_text, bgcolor=is_htf_bullish ? color.green : color.red, text_color=color.white, text_size=size.small)
+
+    table.cell(status_tbl, 0, 2, "Entry Price", bgcolor=label_cell_bg, text_color=color.white, text_size=size.small)
+    table.cell(status_tbl, 1, 2, na(signal_entry) ? "NONE" : str.tostring(signal_entry, "#.#####"), text_color=color.white, text_size=size.small)
+
+    table.cell(status_tbl, 0, 3, "Stop Loss", bgcolor=label_cell_bg, text_color=color.white, text_size=size.small)
+    table.cell(status_tbl, 1, 3, na(signal_sl) ? "NONE" : str.tostring(signal_sl, "#.#####"), text_color=color.red, text_size=size.small)
+
+    table.cell(status_tbl, 0, 4, "Take Profit", bgcolor=label_cell_bg, text_color=color.white, text_size=size.small)
+    table.cell(status_tbl, 1, 4, na(signal_tp) ? "NONE" : str.tostring(signal_tp, "#.#####"), text_color=color.green, text_size=size.small)
+
+    table.cell(status_tbl, 0, 5, "Risk:Reward", bgcolor=label_cell_bg, text_color=color.white, text_size=size.small)
+    table.cell(status_tbl, 1, 5, "1:" + str.tostring(rr_ratio, "#.#"), bgcolor=color.yellow, text_color=color.black, text_size=size.small)
+
+// Static Alertcondition definitions
+alertcondition(buy_signal, title="Alpaca BUY Webhook", message='{"passcode": "MY_SECRET_PASSCODE", "symbol": "{{ticker}}", "action": "BUY"}')
+alertcondition(sell_signal, title="Alpaca SELL Webhook", message='{"passcode": "MY_SECRET_PASSCODE", "symbol": "{{ticker}}", "action": "SELL"}')
+alertcondition(cancel_signal, title="Alpaca CANCEL Webhook", message='{"passcode": "MY_SECRET_PASSCODE", "symbol": "{{ticker}}", "action": "CANCEL"}')
