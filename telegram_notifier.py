@@ -98,3 +98,13 @@ class TelegramNotifier:
             f"<b>Status:</b> {status}\n"
         )
         return self.send_message(msg)
+
+    def send_generic_alert(self, text: str):
+        msg = (
+            f"🔔 <b>TRADINGVIEW ALERT</b>\n\n"
+            f"<code>{text}</code>\n\n"
+            f"📱 <i>vibe-trading webhook bridge</i>"
+        )
+        return self.send_message(msg)
+
+

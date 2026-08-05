@@ -85,25 +85,40 @@ telegram = TelegramNotifier()
 
 @app.post("/webhook")
 async def handle_webhook(request: Request):
+    raw_body = ""
+    data = {}
+    
     try:
-        data = await request.json()
-    except Exception:
         body_bytes = await request.body()
-        try:
-            data = json.loads(body_bytes.decode())
-        except Exception as e:
-            logging.error(f"Failed to parse JSON: {e}")
-            raise HTTPException(status_code=400, detail="Invalid JSON format")
+        raw_body = body_bytes.decode("utf-8", errors="ignore").strip()
+        if raw_body.startswith("{") or raw_body.startswith("["):
+            data = json.loads(raw_body)
+    except Exception as e:
+        logging.warning(f"Non-JSON raw body received: {raw_body}")
 
-    logging.info(f"Incoming Webhook Payload: {data}")
+    logging.info(f"Incoming Webhook Raw: {raw_body}")
 
-    # Passcode Authentication
+    # If payload is plain text (e.g., standard TradingView alert text)
+    if not isinstance(data, dict) or not data:
+        if raw_body:
+            telegram.send_generic_alert(raw_body)
+            return {"status": "success", "message": "Plain text alert sent to Telegram", "raw": raw_body}
+        raise HTTPException(status_code=400, detail="Empty request payload")
+
+    # If JSON is generic/custom without trade actions
+    action = data.get("action", "").upper()
+    if not action:
+        text_content = data.get("text", data.get("message", str(data)))
+        telegram.send_generic_alert(text_content)
+        return {"status": "success", "message": "Generic alert sent to Telegram", "data": data}
+
+    # Passcode Authentication for Order Queueing
     passcode = data.get("passcode")
     if passcode != WEBHOOK_PASSCODE:
-        logging.warning(f"Unauthorized passcode: {passcode}")
-        raise HTTPException(status_code=401, detail="Unauthorized passcode mismatch")
+        logging.warning(f"Unauthorized passcode: {passcode}. Forwarding alert to Telegram only.")
+        telegram.send_generic_alert(str(data))
+        return {"status": "success", "message": "Alert sent to Telegram (Passcode unauthenticated for auto-trading)"}
 
-    action = data.get("action", "").upper()
     symbol = data.get("symbol", "").replace("/", "").replace("PERP", "").replace(".P", "")
     limit_price = float(data.get("limit_price", data.get("price", 0)))
     stop_loss = float(data.get("stop_loss", 0))
@@ -129,7 +144,9 @@ async def handle_webhook(request: Request):
         return {"status": "success", "message": "Cancellation signal queued", "signal_id": signal_entry["id"]}
 
     if not symbol or action not in ["BUY", "SELL"] or limit_price <= 0:
-        raise HTTPException(status_code=400, detail="Invalid trade parameters in payload")
+        telegram.send_generic_alert(f"Invalid Parameters: {data}")
+        return {"status": "success", "message": "Alert sent to Telegram"}
+
 
     signal_entry = {
         "id": str(uuid.uuid4()),
