@@ -115,40 +115,62 @@ def execute_alpaca_cancel():
     except Exception as e:
         logging.error(f"Error canceling orders on Alpaca: {e}")
 
+from telegram_notifier import TelegramNotifier
+telegram = TelegramNotifier()
+
 @app.post("/webhook")
 async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
+    raw_body = ""
+    data = {}
+
     try:
-        data = await request.json()
-    except Exception:
         body_bytes = await request.body()
-        try:
-            data = json.loads(body_bytes.decode())
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid JSON payload: {e}")
+        raw_body = body_bytes.decode("utf-8", errors="ignore").strip()
+        if raw_body.startswith("{") or raw_body.startswith("["):
+            data = json.loads(raw_body)
+    except Exception as e:
+        logging.warning(f"Non-JSON raw body received: {raw_body}")
 
-    logging.info(f"Received Webhook Payload: {data}")
+    logging.info(f"Incoming Webhook Raw: {raw_body}")
 
-    # Passcode Authentication
-    passcode = data.get("passcode")
-    if passcode != os.getenv("WEBHOOK_PASSCODE", WEBHOOK_PASSCODE):
-        raise HTTPException(status_code=401, detail="Unauthorized: Passcode mismatch")
+    # Plain text / generic alert handling
+    if not isinstance(data, dict) or not data:
+        if raw_body:
+            telegram.send_generic_alert(raw_body)
+            return {"status": "success", "message": "Plain text alert sent to Telegram", "raw": raw_body}
+        raise HTTPException(status_code=400, detail="Empty request payload")
 
     action = data.get("action", "").upper()
+    if not action:
+        text_content = data.get("text", data.get("message", str(data)))
+        telegram.send_generic_alert(text_content)
+        return {"status": "success", "message": "Generic alert sent to Telegram", "data": data}
+
+    passcode = data.get("passcode")
+    if passcode != os.getenv("WEBHOOK_PASSCODE", WEBHOOK_PASSCODE):
+        logging.warning(f"Passcode mismatch: {passcode}. Forwarding alert to Telegram.")
+        telegram.send_generic_alert(str(data))
+        return {"status": "success", "message": "Alert sent to Telegram (Passcode unauthenticated for auto-trading)"}
+
+    symbol = data.get("symbol", "").replace("/", "")
+    limit_price = float(data.get("limit_price", data.get("price", 0)))
+    stop_loss = float(data.get("stop_loss", 0))
+    take_profit = float(data.get("take_profit", 0))
+
+    if action == "BREAKEVEN":
+        telegram.send_breakeven_alert(symbol=symbol, entry_price=limit_price, new_sl=stop_loss)
+        return {"status": "success", "message": "Breakeven alert sent to Telegram"}
 
     if action == "CANCEL":
         background_tasks.add_task(execute_alpaca_cancel)
         return {"status": "accepted", "action": "CANCEL", "message": "Cancellation request queued"}
 
-    symbol = data.get("symbol", "").replace("/", "") # Format e.g. EURUSD
-    limit_price = float(data.get("limit_price", 0))
-    stop_loss = float(data.get("stop_loss", 0))
-    take_profit = float(data.get("take_profit", 0))
-
     if not symbol or action not in ["BUY", "SELL"] or limit_price <= 0:
-        raise HTTPException(status_code=400, detail="Invalid trade parameters")
+        telegram.send_generic_alert(f"Alert: {data}")
+        return {"status": "success", "message": "Alert sent to Telegram"}
 
-    # Queue execution in background task for fast instant HTTP 200 response to TradingView
     background_tasks.add_task(execute_alpaca_trade, symbol, action, limit_price, stop_loss, take_profit)
+    telegram.send_signal_alert(symbol=symbol, action=action, price=limit_price, stop_loss=stop_loss, take_profit=take_profit)
 
     return {
         "status": "success",
@@ -156,6 +178,7 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
         "symbol": symbol,
         "message": "Trade payload accepted and queued"
     }
+
 
 @app.post("/cancel_all")
 def cancel_all_orders():
