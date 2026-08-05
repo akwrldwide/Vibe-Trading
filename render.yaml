@@ -1,5 +1,20 @@
 services:
   - type: web
+    name: vibe-trading-crypto-bridge
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn crypto_webhook_bridge:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: WEBHOOK_PASSCODE
+        value: MY_SECRET_PASSCODE
+      - key: TELEGRAM_BOT_TOKEN
+        value: "8720752006:AAFAJTuacGL3BncmGftAaR5jaOnXj_SIpek"
+      - key: TELEGRAM_CHAT_ID
+        value: "1580412709"
+      - key: PORT
+        value: 8000
+
+  - type: web
     name: vibe-trading-fxopen-bridge
     env: python
     buildCommand: "pip install -r requirements.txt"
@@ -7,11 +22,10 @@ services:
     envVars:
       - key: WEBHOOK_PASSCODE
         value: MY_SECRET_PASSCODE
-      - key: FXOPEN_API_URL
-        value: https://demo.forex.game/api/v1
-      - key: FXOPEN_API_KEY
-        value: YOUR_FXOPEN_API_KEY_HERE
-      - key: FXOPEN_SECRET_KEY
-        value: YOUR_FXOPEN_SECRET_KEY_HERE
+      - key: TELEGRAM_BOT_TOKEN
+        value: "8720752006:AAFAJTuacGL3BncmGftAaR5jaOnXj_SIpek"
+      - key: TELEGRAM_CHAT_ID
+        value: "1580412709"
       - key: PORT
         value: 8000
+
