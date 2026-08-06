@@ -81,7 +81,7 @@ COPY --from=builder /opt/venv /opt/venv
 
 # Re-materialize the source tree the editable install references, plus the
 # built frontend static assets.
-COPY pyproject.toml LICENSE README.md alpaca_bridge.py main.py config.json signal_engine.py ./
+COPY pyproject.toml LICENSE README.md main.py alpaca_bridge.py fxopen_bridge.py crypto_webhook_bridge.py mt5_bridge.py telegram_notifier.py signal_engine.py fvg_pullback_engine.py liquidity_sweep_engine.py crypto_signal_engine.py config.json ./
 COPY agent/ agent/
 COPY --from=frontend-build /app/frontend/dist frontend/dist
 
