@@ -17,10 +17,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 app = FastAPI(title="9:30 NY ICT Strategy - FXOpen / Forex.Game Cloud Webhook Bridge")
 
-FXOPEN_API_URL = os.getenv("FXOPEN_API_URL", "https://ttlivewebapi.fxopen.net/api/v1")
-FXOPEN_API_ID = os.getenv("FXOPEN_API_ID", "3656df80-f153-479d-b614-d7746780a2a6")
-FXOPEN_API_KEY = os.getenv("FXOPEN_API_KEY", "rJMdhhNPehKTk2Dy")
-FXOPEN_SECRET_KEY = os.getenv("FXOPEN_SECRET_KEY", "ER5qj6Ea32CK7K4Y2eADzd2ZXtsRtTHTpXmnhZjS52BjChqnwzewSkgB3dC2MYQf")
+FXOPEN_API_URL = os.getenv("FXOPEN_API_URL", "https://marginalttdemowebapi.fxopen.net/api/v1")
+FXOPEN_WS_URL = os.getenv("FXOPEN_WS_URL", "wss://marginalttdemowebapi.fxopen.net/trade")
+FXOPEN_API_ID = os.getenv("FXOPEN_API_ID", "d9232fde-b781-4107-a01a-d8c22f5eb264")
+FXOPEN_API_KEY = os.getenv("FXOPEN_API_KEY", "aAYxNB8RXrDRb4PD")
+FXOPEN_SECRET_KEY = os.getenv("FXOPEN_SECRET_KEY", "8AHHc2KWw59gXhzkzWwCJKdeYkXb7Sf9349qJpyN5ScPTc5PcJ9ADghxxCW3dHYM")
 WEBHOOK_PASSCODE = os.getenv("WEBHOOK_PASSCODE", "MY_SECRET_PASSCODE")
 LOG_FILE = "fxopen_paper_trades.json"
 
@@ -75,8 +76,8 @@ def get_trades():
     return []
 
 def execute_fxopen_trade(symbol: str, action: str, limit_price: float, stop_loss: float, take_profit: float):
-    # Standardize Forex Symbol Format e.g. EURUSD -> EUR/USD
-    formatted_symbol = symbol[:3] + "/" + symbol[3:] if len(symbol) == 6 and "/" not in symbol else symbol
+    # FXOpen Symbol format e.g. EURUSD, GBPUSD (no slash)
+    formatted_symbol = symbol.replace("/", "").upper()
     order_type = "Limit"
     order_side = "Buy" if action == "BUY" else "Sell"
     
@@ -85,9 +86,7 @@ def execute_fxopen_trade(symbol: str, action: str, limit_price: float, stop_loss
         "Type": order_type,
         "Side": order_side,
         "Price": limit_price,
-        "StopLoss": stop_loss,
-        "TakeProfit": take_profit,
-        "Amount": 10000  # 0.1 Lot
+        "Amount": 10000  # 0.1 Lot (10,000 units)
     }
     
     body_str = json.dumps(payload)
@@ -99,7 +98,7 @@ def execute_fxopen_trade(symbol: str, action: str, limit_price: float, stop_loss
         "limit_price": limit_price,
         "stop_loss": stop_loss,
         "take_profit": take_profit,
-        "broker": "FXOpen / Forex.Game"
+        "broker": "FXOpen TickTrader Demo"
     }
 
     try:

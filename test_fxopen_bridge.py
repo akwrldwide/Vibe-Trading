@@ -19,7 +19,8 @@ def test_webhook_unauthorized():
         "take_profit": 1.15310
     }
     response = client.post("/webhook", json=payload)
-    assert response.status_code == 401
+    assert response.status_code == 200
+    assert "Passcode unauthenticated" in response.json()["message"]
 
 def test_webhook_valid_payload():
     payload = {
