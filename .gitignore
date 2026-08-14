@@ -97,3 +97,5 @@ bench_report.json
 scratch/
 *_log.json
 *_trades.json
+*.db
+uploads/

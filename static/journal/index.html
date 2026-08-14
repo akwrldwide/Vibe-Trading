@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>9:30 NY ICT Strategy Journal & Analytics</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/journal.css">
+</head>
+<body>
+  <!-- Ambient Background Glows -->
+  <div class="glow-orb glow-orb-1"></div>
+  <div class="glow-orb glow-orb-2"></div>
+
+  <div class="app-container">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="header-left">
+        <div class="logo-badge">
+          <span class="logo-icon">⚡</span>
+          <div>
+            <h1 class="logo-title">9:30 NY ICT Strategy Journal</h1>
+            <p class="logo-subtitle">Opening Range Breakouts • Retests • Liquidity Sweeps</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="header-actions">
+        <button id="btn-upload-screenshot" class="btn btn-secondary">
+          <span class="btn-icon">📷</span> Auto-Extract Screenshot
+        </button>
+        <button id="btn-new-trade" class="btn btn-primary">
+          <span class="btn-icon">+</span> Log Manual Trade
+        </button>
+        <button id="btn-export-csv" class="btn btn-ghost" title="Export all trades to CSV">
+          <span class="btn-icon">📥</span> Export CSV
+        </button>
+      </div>
+    </header>
+
+    <!-- Top Metrics Row -->
+    <section class="metrics-grid">
+      <div class="metric-card">
+        <div class="metric-header">
+          <span class="metric-label">Win Rate</span>
+          <span class="metric-icon">🎯</span>
+        </div>
+        <div class="metric-value-row">
+          <span id="stat-win-rate" class="metric-value text-emerald">0.0%</span>
+          <span id="stat-trades-count" class="metric-sub">0 completed</span>
+        </div>
+        <div class="progress-bar-bg">
+          <div id="stat-win-rate-bar" class="progress-bar-fill" style="width: 0%"></div>
+        </div>
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-header">
+          <span class="metric-label">Total Realized R</span>
+          <span class="metric-icon">📈</span>
+        </div>
+        <div class="metric-value-row">
+          <span id="stat-total-r" class="metric-value text-purple">+0.00R</span>
+          <span id="stat-win-loss-split" class="metric-sub">0W / 0L / 0BE</span>
+        </div>
+        <div class="metric-hint">R-multiple return based on initial risk</div>
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-header">
+          <span class="metric-label">Profit Factor</span>
+          <span class="metric-icon">⚖️</span>
+        </div>
+        <div class="metric-value-row">
+          <span id="stat-profit-factor" class="metric-value text-amber">0.00</span>
+          <span id="stat-avg-rr" class="metric-sub">Avg R:R 1:2.0</span>
+        </div>
+        <div class="metric-hint">Gross Gains (R) / Gross Losses (R)</div>
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-header">
+          <span class="metric-label">Net Realized PnL</span>
+          <span class="metric-icon">💰</span>
+        </div>
+        <div class="metric-value-row">
+          <span id="stat-total-pnl" class="metric-value text-blue">$0.00</span>
+          <span id="stat-open-count" class="metric-sub">0 Open</span>
+        </div>
+        <div class="metric-hint">Dollar profit / loss across all accounts</div>
+      </div>
+    </section>
+
+    <!-- Equity Curve & Analytics Section -->
+    <section class="analytics-card">
+      <div class="analytics-header">
+        <div class="analytics-title-group">
+          <h2 class="section-title">Performance Curve (Cumulative R-Multiples)</h2>
+          <span class="badge badge-purple">9:30 NY Session</span>
+        </div>
+        <div class="chart-summary-pills">
+          <span class="pill pill-green" id="pill-best-pair">Best Asset: --</span>
+          <span class="pill pill-purple" id="pill-best-setup">Top Setup: --</span>
+        </div>
+      </div>
+      <div class="chart-wrapper">
+        <canvas id="equity-chart" height="140"></canvas>
+      </div>
+    </section>
+
+    <!-- Filter & Search Toolbar -->
+    <section class="toolbar-card">
+      <div class="filters-row">
+        <div class="filter-group">
+          <label for="filter-symbol">Symbol</label>
+          <select id="filter-symbol" class="select-input">
+            <option value="ALL">All Symbols</option>
+            <option value="BTCUSDT">BTCUSDT</option>
+            <option value="EURUSD">EURUSD</option>
+            <option value="GBPUSD">GBPUSD</option>
+            <option value="NQ1!">NQ / Nasdaq</option>
+            <option value="ES1!">ES / S&P 500</option>
+          </select>
+        </div>
+
+        <div class="filter-group">
+          <label for="filter-action">Direction</label>
+          <select id="filter-action" class="select-input">
+            <option value="ALL">All Directions</option>
+            <option value="BUY">BUY (Long)</option>
+            <option value="SELL">SELL (Short)</option>
+          </select>
+        </div>
+
+        <div class="filter-group">
+          <label for="filter-outcome">Outcome</label>
+          <select id="filter-outcome" class="select-input">
+            <option value="ALL">All Outcomes</option>
+            <option value="WIN">WIN</option>
+            <option value="LOSS">LOSS</option>
+            <option value="BREAK-EVEN">BREAK-EVEN</option>
+            <option value="OPEN">OPEN / PENDING</option>
+          </select>
+        </div>
+
+        <div class="filter-group">
+          <label for="filter-setup">Setup Type</label>
+          <select id="filter-setup" class="select-input">
+            <option value="ALL">All Setups</option>
+            <option value="OR Breakout (Candle 2 FVG)">OR Breakout (Candle 2 FVG)</option>
+            <option value="OR Retest / Continuation FVG">OR Retest / Continuation FVG</option>
+            <option value="Liquidity Sweep / IFVG Reversal">Liquidity Sweep / IFVG Reversal</option>
+          </select>
+        </div>
+
+        <div class="filter-group">
+          <label for="sort-by">Sort By</label>
+          <select id="sort-by" class="select-input">
+            <option value="trade_date:DESC">Date (Newest First)</option>
+            <option value="trade_date:ASC">Date (Oldest First)</option>
+            <option value="realized_r:DESC">Highest Return (R)</option>
+            <option value="realized_r:ASC">Lowest Return (R)</option>
+            <option value="realized_pnl:DESC">Highest PnL ($)</option>
+          </select>
+        </div>
+
+        <div class="view-toggle-group">
+          <label>View Mode</label>
+          <div class="toggle-buttons">
+            <button id="view-table-btn" class="toggle-btn active" title="Table View">☰ Table</button>
+            <button id="view-cards-btn" class="toggle-btn" title="Card Grid View">⊞ Cards</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Main Trades Container -->
+    <main class="trades-container">
+      <!-- Table View -->
+      <div id="trades-table-view" class="view-panel active">
+        <div class="table-responsive">
+          <table class="trades-table">
+            <thead>
+              <tr>
+                <th>Date & NY Time</th>
+                <th>Symbol</th>
+                <th>Action</th>
+                <th>Setup Model</th>
+                <th>HTF Bias</th>
+                <th>Entry Price</th>
+                <th>Stop Loss</th>
+                <th>Take Profit</th>
+                <th>Planned R:R</th>
+                <th>Outcome</th>
+                <th>Realized R</th>
+                <th>Chart</th>
+                <th class="text-right">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="trades-table-body">
+              <!-- Dynamically Populated -->
+            </tbody>
+          </table>
+        </div>
+        <div id="table-empty-state" class="empty-state hidden">
+          <span class="empty-icon">📂</span>
+          <h3>No trades match the selected filters</h3>
+          <p>Try resetting the filters or log a new 9:30 NY ICT trade.</p>
+        </div>
+      </div>
+
+      <!-- Card Grid View -->
+      <div id="trades-cards-view" class="view-panel hidden">
+        <div id="trades-card-grid" class="cards-grid">
+          <!-- Dynamically Populated -->
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- Modal: Log / Edit Trade -->
+  <div id="trade-modal" class="modal-overlay hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h2 id="modal-title" class="modal-heading">Log 9:30 NY ICT Trade</h2>
+        <button id="modal-close-btn" class="btn-close">&times;</button>
+      </div>
+
+      <form id="trade-form" class="modal-form">
+        <input type="hidden" id="form-trade-id" value="">
+        <input type="hidden" id="form-screenshot-url" value="">
+
+        <div class="form-row form-row-3">
+          <div class="form-field">
+            <label for="form-date">Session Date *</label>
+            <input type="date" id="form-date" required class="input-text">
+          </div>
+          <div class="form-field">
+            <label for="form-ny-time">NY Time</label>
+            <input type="text" id="form-ny-time" placeholder="e.g. 09:58 AM" class="input-text">
+          </div>
+          <div class="form-field">
+            <label for="form-symbol">Symbol / Asset *</label>
+            <input type="text" id="form-symbol" placeholder="e.g. BTCUSDT" required class="input-text uppercase">
+          </div>
+        </div>
+
+        <div class="form-row form-row-3">
+          <div class="form-field">
+            <label for="form-action">Trade Direction *</label>
+            <select id="form-action" class="select-input" required>
+              <option value="BUY">BUY (Long)</option>
+              <option value="SELL">SELL (Short)</option>
+            </select>
+          </div>
+          <div class="form-field">
+            <label for="form-setup-type">Setup Classification</label>
+            <select id="form-setup-type" class="select-input">
+              <option value="OR Breakout (Candle 2 FVG)">OR Breakout (Candle 2 FVG)</option>
+              <option value="OR Retest / Continuation FVG">OR Retest / Continuation FVG</option>
+              <option value="Liquidity Sweep / IFVG Reversal">Liquidity Sweep / IFVG Reversal</option>
+            </select>
+          </div>
+          <div class="form-field">
+            <label for="form-htf-bias">HTF Bias (15m/1H)</label>
+            <select id="form-htf-bias" class="select-input">
+              <option value="BEARISH">BEARISH</option>
+              <option value="BULLISH">BULLISH</option>
+              <option value="NEUTRAL">NEUTRAL</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="form-row form-row-4">
+          <div class="form-field">
+            <label for="form-entry">Entry Price *</label>
+            <input type="number" step="any" id="form-entry" placeholder="63816.75" required class="input-text font-mono">
+          </div>
+          <div class="form-field">
+            <label for="form-sl">Stop Loss *</label>
+            <input type="number" step="any" id="form-sl" placeholder="63738.10" required class="input-text font-mono">
+          </div>
+          <div class="form-field">
+            <label for="form-tp">Take Profit *</label>
+            <input type="number" step="any" id="form-tp" placeholder="63974.05" required class="input-text font-mono">
+          </div>
+          <div class="form-field">
+            <label for="form-rr">Target R:R</label>
+            <input type="number" step="0.1" id="form-rr" value="2.0" class="input-text font-mono">
+          </div>
+        </div>
+
+        <div class="form-row form-row-3">
+          <div class="form-field">
+            <label for="form-outcome">Trade Outcome *</label>
+            <select id="form-outcome" class="select-input">
+              <option value="WIN">WIN (Full Target)</option>
+              <option value="LOSS">LOSS (Stopped Out)</option>
+              <option value="BREAK-EVEN">BREAK-EVEN</option>
+              <option value="OPEN">OPEN / PENDING</option>
+            </select>
+          </div>
+          <div class="form-field">
+            <label for="form-realized-r">Realized Return (R)</label>
+            <input type="number" step="0.01" id="form-realized-r" placeholder="+2.00" class="input-text font-mono">
+          </div>
+          <div class="form-field">
+            <label for="form-realized-pnl">Realized PnL ($)</label>
+            <input type="number" step="any" id="form-realized-pnl" placeholder="+250.00" class="input-text font-mono">
+          </div>
+        </div>
+
+        <div class="form-row form-row-2">
+          <div class="form-field">
+            <label for="form-or-high">15m OR High</label>
+            <input type="number" step="any" id="form-or-high" placeholder="63830.40" class="input-text font-mono">
+          </div>
+          <div class="form-field">
+            <label for="form-or-low">15m OR Low</label>
+            <input type="number" step="any" id="form-or-low" placeholder="63523.50" class="input-text font-mono">
+          </div>
+        </div>
+
+        <div class="form-field">
+          <label for="form-notes">Trade Notes & Confluences</label>
+          <textarea id="form-notes" rows="3" placeholder="Displacement candle 2 broke OR with clean 3-bar gap. Retest held nicely above CE..." class="textarea-input"></textarea>
+        </div>
+
+        <!-- Screenshot Preview In Modal -->
+        <div id="form-screenshot-preview-container" class="screenshot-preview-container hidden">
+          <span class="preview-label">Attached Chart Screenshot:</span>
+          <div class="preview-box">
+            <img id="form-screenshot-img" src="" alt="Trade Chart">
+            <button type="button" id="btn-remove-screenshot" class="btn-remove">&times; Remove</button>
+          </div>
+        </div>
+
+        <div class="modal-footer">
+          <button type="button" id="btn-cancel-modal" class="btn btn-ghost">Cancel</button>
+          <button type="submit" id="btn-save-trade" class="btn btn-primary">Save Trade Record</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Modal: Smart Screenshot Extractor -->
+  <div id="extract-modal" class="modal-overlay hidden">
+    <div class="modal-card modal-card-lg">
+      <div class="modal-header">
+        <div class="modal-title-row">
+          <span class="icon-pulse">📷</span>
+          <div>
+            <h2 class="modal-heading">Smart Screenshot Trade Extraction</h2>
+            <p class="modal-subheading">Drop any TradingView chart screenshot to auto-populate the trade details</p>
+          </div>
+        </div>
+        <button id="extract-modal-close-btn" class="btn-close">&times;</button>
+      </div>
+
+      <div class="extract-body">
+        <!-- Dropzone -->
+        <div id="screenshot-dropzone" class="dropzone">
+          <input type="file" id="screenshot-file-input" accept="image/*" class="file-hidden">
+          <div class="dropzone-content">
+            <span class="dropzone-icon">📥</span>
+            <h3>Drag & Drop TradingView Screenshot Here</h3>
+            <p>or <span class="text-purple link-like">browse your files</span> / paste from clipboard (<kbd>Ctrl+V</kbd>)</p>
+            <span class="dropzone-hint">Supports PNG, JPG, WebP from TradingView overlays & tables</span>
+          </div>
+        </div>
+
+        <!-- Extraction Loading State -->
+        <div id="extract-loading" class="extract-loading hidden">
+          <div class="spinner"></div>
+          <p>Analyzing chart structure, table badges, and trade levels...</p>
+        </div>
+
+        <!-- Extraction Preview & Quick Confirm -->
+        <div id="extract-result-container" class="extract-result-container hidden">
+          <div class="extract-split">
+            <div class="extract-image-side">
+              <h4>Chart Image Preview</h4>
+              <div class="image-frame">
+                <img id="extracted-img-preview" src="" alt="Chart Screenshot">
+              </div>
+            </div>
+            <div class="extract-data-side">
+              <div class="badge-row">
+                <span class="badge badge-green">✓ Extracted Details</span>
+                <span id="extract-confidence-badge" class="badge badge-purple">High Precision</span>
+              </div>
+
+              <div class="extracted-fields-grid">
+                <div class="field-item">
+                  <span class="field-label">Symbol:</span>
+                  <input type="text" id="ext-symbol" class="input-text-sm font-mono uppercase">
+                </div>
+                <div class="field-item">
+                  <span class="field-label">Action:</span>
+                  <select id="ext-action" class="select-input-sm">
+                    <option value="BUY">BUY</option>
+                    <option value="SELL">SELL</option>
+                  </select>
+                </div>
+                <div class="field-item">
+                  <span class="field-label">Entry:</span>
+                  <input type="number" step="any" id="ext-entry" class="input-text-sm font-mono">
+                </div>
+                <div class="field-item">
+                  <span class="field-label">Stop Loss:</span>
+                  <input type="number" step="any" id="ext-sl" class="input-text-sm font-mono text-red">
+                </div>
+                <div class="field-item">
+                  <span class="field-label">Take Profit:</span>
+                  <input type="number" step="any" id="ext-tp" class="input-text-sm font-mono text-emerald">
+                </div>
+                <div class="field-item">
+                  <span class="field-label">HTF Bias:</span>
+                  <select id="ext-htf-bias" class="select-input-sm">
+                    <option value="BEARISH">BEARISH</option>
+                    <option value="BULLISH">BULLISH</option>
+                    <option value="NEUTRAL">NEUTRAL</option>
+                  </select>
+                </div>
+                <div class="field-item">
+                  <span class="field-label">Outcome:</span>
+                  <select id="ext-outcome" class="select-input-sm">
+                    <option value="WIN">WIN</option>
+                    <option value="LOSS">LOSS</option>
+                    <option value="BREAK-EVEN">BREAK-EVEN</option>
+                    <option value="OPEN">OPEN</option>
+                  </select>
+                </div>
+                <div class="field-item">
+                  <span class="field-label">Target R:R:</span>
+                  <input type="number" step="0.1" id="ext-rr" value="2.0" class="input-text-sm font-mono">
+                </div>
+              </div>
+
+              <div class="field-item full-width">
+                <span class="field-label">Session Notes:</span>
+                <input type="text" id="ext-notes" class="input-text-sm" placeholder="Add session observations...">
+              </div>
+
+              <div class="extract-action-buttons">
+                <button type="button" id="btn-re-upload" class="btn btn-ghost btn-sm">Upload Another</button>
+                <button type="button" id="btn-confirm-extraction" class="btn btn-primary">✓ Confirm & Save to Journal</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Lightbox Modal for Full-Size Screenshot View -->
+  <div id="lightbox-modal" class="modal-overlay hidden">
+    <div class="lightbox-content">
+      <button id="lightbox-close-btn" class="lightbox-close">&times;</button>
+      <img id="lightbox-img" src="" alt="Full Chart">
+    </div>
+  </div>
+
+  <script src="/static/journal.js"></script>
+</body>
+</html>
