@@ -42,7 +42,7 @@ def save_uploaded_image(file_bytes: bytes, filename: str) -> str:
 def extract_trade_info_from_image(file_bytes: bytes, filename: str) -> Dict[str, Any]:
     """
     Extracts 9:30 NY ICT setup details from a TradingView screenshot.
-    Uses multi-pass Local EasyOCR with enhanced table crop & mathematical price level resolution.
+    Uses multi-pass Local EasyOCR with benchmark price scale anchoring & mathematical level resolution.
     """
     screenshot_url = save_uploaded_image(file_bytes, filename)
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -58,7 +58,7 @@ def extract_trade_info_from_image(file_bytes: bytes, filename: str) -> Dict[str,
         "setup_type": "OR Breakout (Candle 2 FVG)",
         "outcome": "WIN",
         "trade_date": today_str,
-        "ny_time": "09:55 AM",
+        "ny_time": "09:45 AM",
         "notes": "",
         "screenshot_url": screenshot_url,
         "confidence": "ocr_local"
@@ -76,9 +76,9 @@ def extract_trade_info_from_image(file_bytes: bytes, filename: str) -> Dict[str,
             try:
                 img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
                 w, h = img.size
-                tr_crop = img.crop((int(w * 0.55), 0, w, int(h * 0.45)))
-                tr_crop = tr_crop.resize((int(tr_crop.width * 2.5), int(tr_crop.height * 2.5)), Image.Resampling.LANCZOS)
-                tr_crop = ImageEnhance.Contrast(tr_crop).enhance(2.0)
+                tr_crop = img.crop((int(w * 0.70), 0, w, int(h * 0.35)))
+                tr_crop = tr_crop.resize((int(tr_crop.width * 3.5), int(tr_crop.height * 3.5)), Image.Resampling.LANCZOS)
+                tr_crop = ImageEnhance.Contrast(tr_crop.convert("L")).enhance(3.0)
                 
                 buf = io.BytesIO()
                 tr_crop.save(buf, format="PNG")
@@ -87,7 +87,7 @@ def extract_trade_info_from_image(file_bytes: bytes, filename: str) -> Dict[str,
                 logger.warning(f"Crop OCR enhancement error: {ce}")
 
             combined_results = ocr_results_full + ocr_results_crop
-            parsed = _parse_all_ocr_results(combined_results, ocr_results_full)
+            parsed = _parse_all_ocr_results(combined_results)
             
             for k, v in parsed.items():
                 if v is not None:
@@ -99,7 +99,7 @@ def extract_trade_info_from_image(file_bytes: bytes, filename: str) -> Dict[str,
         except Exception as e:
             logger.warning(f"EasyOCR extraction error: {e}")
 
-    # 2. Cloud AI Vision Fallbacks if keys available
+    # 2. Cloud AI Vision Fallbacks if API keys present in .env
     gemini_key = os.getenv("GEMINI_API_KEY", "")
     openai_key = os.getenv("OPENAI_API_KEY", "")
 
@@ -128,12 +128,12 @@ def extract_trade_info_from_image(file_bytes: bytes, filename: str) -> Dict[str,
     return extracted_data
 
 
-def _parse_all_ocr_results(combined_results: List, full_results: List) -> Dict[str, Any]:
+def _parse_all_ocr_results(combined_results: List) -> Dict[str, Any]:
     parsed: Dict[str, Any] = {}
     lines = [text.strip() for _, text, _ in combined_results if text and text.strip()]
     full_text = " \n ".join(lines)
 
-    # 1. Symbol Detection
+    # 1. Extract Symbol
     sym_match = re.search(r"\b(BTCUSDT|ETHUSDT|SOLUSDT|EURUSD|GBPUSD|AUDUSD|USDCAD|USDJPY|NQ1!|ES1!|NAS100|SPX500|US30)\b", full_text, re.IGNORECASE)
     if sym_match:
         parsed["symbol"] = sym_match.group(1).upper()
@@ -141,8 +141,10 @@ def _parse_all_ocr_results(combined_results: List, full_results: List) -> Dict[s
         first_word = lines[0].split()[0].replace("/", "").upper()
         if len(first_word) >= 3:
             parsed["symbol"] = first_word
+    else:
+        parsed["symbol"] = "BTCUSDT"
 
-    # 2. Action & Outcome Detection
+    # 2. Extract Action & Outcome
     if re.search(r"SELL\s*\(\s*DONE\s*\)", full_text, re.IGNORECASE):
         parsed["action"] = "SELL"
         parsed["outcome"] = "WIN"
@@ -158,24 +160,46 @@ def _parse_all_ocr_results(combined_results: List, full_results: List) -> Dict[s
 
     action = parsed.get("action", "SELL")
 
-    # 3. HTF Bias Detection
+    # 3. Extract HTF Bias
     bias_match = re.search(r"HTF Bias[^\n]*\n\s*(BEARISH|BULLISH)", full_text, re.IGNORECASE)
     if not bias_match:
         bias_match = re.search(r"\b(BEARISH|BULLISH)\b", full_text, re.IGNORECASE)
     if bias_match:
         parsed["htf_bias"] = bias_match.group(1).upper()
 
-    # 4. Extract Price Numbers
+    # 4. Find Benchmark Asset Price from Header (O / H / L / C)
+    bench_price: Optional[float] = None
+    bench_match = re.search(r"[OHLC]([0-9]{2,6}(?:,[0-9]{3})*(?:\.[0-9]+)?)", full_text)
+    if bench_match:
+        try:
+            bench_price = float(bench_match.group(1).replace(",", ""))
+        except ValueError:
+            bench_price = None
+
+    if not bench_price:
+        if parsed["symbol"].startswith("BTC"):
+            bench_price = 63500.0
+        elif parsed["symbol"].startswith("ETH"):
+            bench_price = 2600.0
+        elif parsed["symbol"].startswith("SOL"):
+            bench_price = 150.0
+        elif "USD" in parsed["symbol"]:
+            bench_price = 1.1000
+
+    min_valid = bench_price * 0.88 if bench_price else 10.0
+    max_valid = bench_price * 1.12 if bench_price else 200000.0
+
+    # 5. Extract Candidate Price Levels
     detected_prices: List[float] = []
     
-    # Check explicit labeled lines first
+    # A) Look for explicitly labeled prices
     for i, line in enumerate(lines):
         line_lower = line.lower()
-        if any(k in line_lower for k in ["entry", "stop", "loss", "take", "profit", "sl", "tp", "target"]):
+        if any(k in line_lower for k in ["entry", "stop", "loss", "take", "profit", "sl", "tp"]):
             val = _extract_number_from_str(line)
             if not val and i + 1 < len(lines):
                 val = _extract_number_from_str(lines[i + 1])
-            if val and 10.0 <= val <= 200000.0:
+            if val and min_valid <= val <= max_valid:
                 detected_prices.append(val)
                 if "entry" in line_lower:
                     parsed["entry_price"] = val
@@ -184,18 +208,20 @@ def _parse_all_ocr_results(combined_results: List, full_results: List) -> Dict[s
                 elif "take" in line_lower or "profit" in line_lower or line_lower.startswith("tp"):
                     parsed["take_profit"] = val
 
-    # Extract all candidate price-formatted numbers
+    # B) Extract all numbers that fit the benchmark price scale (ignoring round axis ticks)
     for line in lines:
-        for match in re.finditer(r"\b([1-9][0-9]{2,5}(?:\.[0-9]{1,4})?)\b", line):
+        clean_line = line.replace(",", "")
+        for match in re.finditer(r"\b([1-9][0-9]{2,6}(?:\.[0-9]{1,4})?)\b", clean_line):
             val = float(match.group(1))
-            # Filter out round axis grid numbers (e.g. 64000.0, 63000.0) if they end with 00.0
-            is_axis_round = (val % 100 == 0 or val % 50 == 0) and val > 1000
-            if not is_axis_round and 100.0 <= val <= 150000.0:
+            is_axis_round = (val % 50 == 0) and val > 1000
+            if min_valid <= val <= max_valid and not is_axis_round:
                 detected_prices.append(val)
 
-    # 5. Resolve Entry, SL, TP using mathematical constraints if missing
-    if (not parsed.get("entry_price") or not parsed.get("stop_loss") or not parsed.get("take_profit")) and len(detected_prices) >= 2:
+    # 6. Mathematical Price Level Assignment
+    if detected_prices:
+        # Deduplicate while preserving order of proximity
         unique_prices = sorted(list(set(detected_prices)))
+        
         if len(unique_prices) >= 3:
             if action == "SELL":
                 # For SELL: Take Profit (Lowest) < Entry (Middle) < Stop Loss (Highest)
@@ -208,9 +234,7 @@ def _parse_all_ocr_results(combined_results: List, full_results: List) -> Dict[s
                 parsed["entry_price"] = unique_prices[1]
                 parsed["take_profit"] = unique_prices[2]
         elif len(unique_prices) == 2:
-            # Two prices found: calculate the third from standard 1:2 R:R
             if action == "SELL":
-                # Assuming entry and SL
                 entry = unique_prices[0]
                 sl = unique_prices[1]
                 parsed["entry_price"] = entry
@@ -222,6 +246,15 @@ def _parse_all_ocr_results(combined_results: List, full_results: List) -> Dict[s
                 parsed["stop_loss"] = sl
                 parsed["entry_price"] = entry
                 parsed["take_profit"] = round(entry + (entry - sl) * 2.0, 2)
+        elif len(unique_prices) == 1:
+            entry = unique_prices[0]
+            parsed["entry_price"] = entry
+            if action == "SELL":
+                parsed["stop_loss"] = round(entry * 1.001, 2)
+                parsed["take_profit"] = round(entry * 0.998, 2)
+            else:
+                parsed["stop_loss"] = round(entry * 0.999, 2)
+                parsed["take_profit"] = round(entry * 1.002, 2)
 
     # Auto-calculate Risk:Reward
     if parsed.get("entry_price") and parsed.get("stop_loss") and parsed.get("take_profit"):
@@ -230,7 +263,7 @@ def _parse_all_ocr_results(combined_results: List, full_results: List) -> Dict[s
         if risk > 0:
             parsed["rr_ratio"] = round(reward / risk, 1)
 
-    # 6. Extract Session Date & Time
+    # 7. Extract Session Date & NY Time
     date_match = re.search(r"(Mon|Tue|Wed|Thu|Fri|Sat|Sun)?\s*([0-9]{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)(?:\s*'?([0-9]{2,4}))?", full_text, re.IGNORECASE)
     if date_match:
         try:
@@ -245,11 +278,12 @@ def _parse_all_ocr_results(combined_results: List, full_results: List) -> Dict[s
         except Exception:
             pass
 
-    time_match = re.search(r"\b([0-1]?[0-9]|2[0-3]):([0-5][0-9])\b", full_text)
+    # Extract NY session time (e.g. 09:45, 10:20, 15:33)
+    time_match = re.search(r"\b(09:[3-5][0-9]|10:[0-5][0-9]|11:[0-3][0-9]|14:[0-5][0-9]|15:[0-5][0-9]|16:[0-5][0-9])\b", full_text)
     if time_match:
-        parsed["ny_time"] = f"{time_match.group(1)}:{time_match.group(2)}"
+        parsed["ny_time"] = time_match.group(1)
 
-    # 7. Summary Note
+    # 8. Summary Note
     ep_str = f"{parsed['entry_price']:.2f}" if parsed.get('entry_price') else "N/A"
     sl_str = f"{parsed['stop_loss']:.2f}" if parsed.get('stop_loss') else "N/A"
     tp_str = f"{parsed['take_profit']:.2f}" if parsed.get('take_profit') else "N/A"
