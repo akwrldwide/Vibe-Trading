@@ -94,6 +94,8 @@ const elements = {
   extractLoading: document.getElementById("extract-loading"),
   extractResultContainer: document.getElementById("extract-result-container"),
   extractedImgPreview: document.getElementById("extracted-img-preview"),
+  extDate: document.getElementById("ext-date"),
+  extNyTime: document.getElementById("ext-ny-time"),
   extSymbol: document.getElementById("ext-symbol"),
   extAction: document.getElementById("ext-action"),
   extEntry: document.getElementById("ext-entry"),
@@ -743,13 +745,15 @@ async function handleFileUpload(file) {
 
 function populateExtractedFields(data) {
   elements.extractedImgPreview.src = data.screenshot_url;
+  elements.extDate.value = data.trade_date || new Date().toISOString().split("T")[0];
+  elements.extNyTime.value = data.ny_time || "09:55 AM";
   elements.extSymbol.value = data.symbol || "BTCUSDT";
   elements.extAction.value = data.action || "BUY";
-  elements.extEntry.value = data.entry_price || "";
-  elements.extSl.value = data.stop_loss || "";
-  elements.extTp.value = data.take_profit || "";
+  elements.extEntry.value = data.entry_price !== null && data.entry_price !== undefined ? data.entry_price : "";
+  elements.extSl.value = data.stop_loss !== null && data.stop_loss !== undefined ? data.stop_loss : "";
+  elements.extTp.value = data.take_profit !== null && data.take_profit !== undefined ? data.take_profit : "";
   elements.extHtfBias.value = data.htf_bias || "BEARISH";
-  elements.extOutcome.value = data.outcome || "OPEN";
+  elements.extOutcome.value = data.outcome || "WIN";
   elements.extRr.value = data.rr_ratio || 2.0;
   elements.extNotes.value = data.notes || "Captured from TradingView 9:30 NY ICT setup screenshot.";
 }
@@ -768,8 +772,8 @@ async function handleConfirmExtraction() {
   else if (outcome === "LOSS") realizedR = -1.0;
 
   const payload = {
-    trade_date: currentExtractedData.trade_date || new Date().toISOString().split("T")[0],
-    ny_time: currentExtractedData.ny_time || "09:55 AM",
+    trade_date: elements.extDate.value || currentExtractedData.trade_date || new Date().toISOString().split("T")[0],
+    ny_time: elements.extNyTime.value || currentExtractedData.ny_time || "09:55 AM",
     symbol: elements.extSymbol.value.toUpperCase().trim(),
     action: elements.extAction.value,
     setup_type: currentExtractedData.setup_type || "OR Breakout (Candle 2 FVG)",
