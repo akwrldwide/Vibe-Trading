@@ -1,0 +1,280 @@
+//@version=6
+strategy("ICT Liquidity Sweep & Inverse Fair Value Gap (IFVG) Strategy [vibe-trading]", overlay=true, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, commission_type=strategy.commission.percent, commission_value=0.05, slippage=3)
+
+// ==============================================================================
+// 1. INPUT PARAMETERS & USER SETTINGS
+// ==============================================================================
+group_core       = "1. Liquidity & Sweep Engine"
+swingLookback    = input.int(40, "Swing High/Low Lookback Window", minval=10, maxval=200, group=group_core, tooltip="Bars to calculate major liquidity levels")
+sweepWickPct     = input.float(0.20, "Min Sweep Rejection Wick (% of Bar Range)", minval=0.05, maxval=0.80, step=0.05, group=group_core)
+atrPeriod        = input.int(14, "ATR Period", minval=1, group=group_core)
+slBufferAtr      = input.float(0.6, "Stop Loss Buffer (ATR Mult)", minval=0.1, step=0.1, group=group_core, tooltip="Safety padding placed beyond manipulation extreme")
+
+group_ifvg       = "2. Fair Value Gap & Inversion Settings"
+minFvgAtrRatio   = input.float(0.08, "Min FVG Imbalance Size (ATR Ratio)", minval=0.01, step=0.01, group=group_ifvg)
+fvgValidityBars  = input.int(15, "Max Bars FVG Remains Valid Post-Sweep", minval=3, maxval=50, group=group_ifvg)
+entryMode        = input.string("Immediate Close", "Entry Execution Mode", options=["Immediate Close", "IFVG Retest Pullback", "50% Close / 50% Retest"], group=group_ifvg)
+
+group_risk       = "3. Asymmetric Take Profit & Breakeven"
+tp1RrRatio       = input.float(1.4, "TP1 Target (RR Ratio)", minval=0.5, step=0.1, group=group_risk, tooltip="Partial exit target where Stop Loss moves to Breakeven")
+tp2RrRatio       = input.float(2.8, "TP2 Target (RR Ratio)", minval=1.0, step=0.1, group=group_risk, tooltip="Runner exit target or opposing swing liquidity")
+closePctTp1      = input.float(50.0, "TP1 Close Quantity (%)", minval=10.0, maxval=100.0, step=10.0, group=group_risk)
+useBreakeven     = input.bool(true, "Enable Automated Breakeven Stop", group=group_risk)
+beOffsetAtr      = input.float(0.1, "Breakeven Lock-in Profit (ATR Mult)", step=0.05, group=group_risk)
+
+group_filters    = "4. Confluence & Trend Filters"
+useHtfFilter     = input.bool(true, "Enable 4H Macro Trend Filter", group=group_filters)
+htfResolution    = input.timeframe("240", "HTF Timeframe", group=group_filters)
+htfEmaPeriod     = input.int(50, "HTF Trend EMA Period", group=group_filters)
+useVolFilter     = input.bool(true, "Enable Sweep Volume Absorption Filter", group=group_filters)
+volSmaPeriod     = input.int(20, "Volume SMA Period", group=group_filters)
+volMult          = input.float(1.10, "Sweep Volume Multiplier", step=0.05, group=group_filters)
+
+group_ui         = "5. UI & Visual Dashboard"
+showBoxes        = input.bool(true, "Draw FVG / IFVG Imbalance Boxes", group=group_ui)
+showSwings       = input.bool(true, "Draw Swing Liquidity Lines", group=group_ui)
+showDashboard    = input.bool(true, "Show Strategy Performance HUD", group=group_ui)
+dashPosition     = input.string(position.top_right, "HUD Position", options=[position.top_right, position.bottom_right, position.top_left, position.bottom_left], group=group_ui)
+
+// ==============================================================================
+// 2. INDICATORS & MARKET STRUCTURE COMPUTATIONS
+// ==============================================================================
+atrVal = ta.atr(atrPeriod)
+volSma = ta.sma(volume, volSmaPeriod)
+
+// Higher Timeframe (4H) Trend EMA
+htfClose = request.security(syminfo.tickerid, htfResolution, close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+htfEma   = request.security(syminfo.tickerid, htfResolution, ta.ema(close, htfEmaPeriod), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+htfLongOk  = not useHtfFilter or (htfClose >= htfEma)
+htfShortOk = not useHtfFilter or (htfClose <= htfEma)
+
+// Rolling Swing High & Swing Low (excluding current forming bar)
+swingHigh = ta.highest(high, swingLookback)[1]
+swingLow  = ta.lowest(low, swingLookback)[1]
+
+// Volume & Candle Characteristics
+barRange   = math.max(high - low, syminfo.mintick)
+lowerWick  = math.min(open, close) - low
+upperWick  = high - math.max(open, close)
+volOk      = not useVolFilter or (volume >= volSma * volMult)
+
+// Sweep Detection
+isBullSweep = (low < swingLow) and (close >= swingLow) and (lowerWick / barRange >= sweepWickPct) and volOk
+isBearSweep = (high > swingHigh) and (close <= swingHigh) and (upperWick / barRange >= sweepWickPct) and volOk
+
+// ==============================================================================
+// 3. FAIR VALUE GAP (FVG) & INVERSE FVG (IFVG) ENGINE
+// ==============================================================================
+// Bearish FVG: High of bar 0 < Low of bar 2 (Downside Imbalance)
+isBearFvg = (high[0] < low[2]) and ((low[2] - high[0]) >= (minFvgAtrRatio * atrVal))
+bearFvgTop = isBearFvg ? low[2] : na
+bearFvgBot = isBearFvg ? high[0] : na
+
+// Bullish FVG: Low of bar 0 > High of bar 2 (Upside Imbalance)
+isBullFvg = (low[0] > high[2]) and ((low[0] - high[2]) >= (minFvgAtrRatio * atrVal))
+bullFvgTop = isBullFvg ? low[0] : na
+bullFvgBot = isBullFvg ? high[2] : na
+
+// Persistent Tracking of Active FVGs near Sweeps
+var int   lastBullSweepBar = na
+var float lastBullSweepLow = na
+var float activeBearFvgTop = na
+var float activeBearFvgBot = na
+var int   activeBearFvgBar = na
+
+var int   lastBearSweepBar = na
+var float lastBearSweepHigh = na
+var float activeBullFvgTop = na
+var float activeBullFvgBot = na
+var int   activeBullFvgBar = na
+
+// Update Bullish Sweep State
+if isBullSweep
+    lastBullSweepBar := bar_index
+    lastBullSweepLow := low
+
+// Store most recent Bearish FVG formed near Bullish Sweep
+if isBearFvg and not na(lastBullSweepBar) and (bar_index - lastBullSweepBar <= fvgValidityBars)
+    activeBearFvgTop := bearFvgTop
+    activeBearFvgBot := bearFvgBot
+    activeBearFvgBar := bar_index
+
+// Update Bearish Sweep State
+if isBearSweep
+    lastBearSweepBar := bar_index
+    lastBearSweepHigh := high
+
+// Store most recent Bullish FVG formed near Bearish Sweep
+if isBullFvg and not na(lastBearSweepBar) and (bar_index - lastBearSweepBar <= fvgValidityBars)
+    activeBullFvgTop := bullFvgTop
+    activeBullFvgBot := bullFvgBot
+    activeBullFvgBar := bar_index
+
+// Check for IFVG Inversion (The Trigger)
+// Long Trigger: Price breaks and closes ABOVE the Bearish FVG Top
+isLongIfvgTrigger = false
+if not na(activeBearFvgTop) and not na(lastBullSweepBar)
+    if (bar_index - lastBullSweepBar <= fvgValidityBars) and (close > activeBearFvgTop) and (close[1] <= activeBearFvgTop)
+        if htfLongOk
+            isLongIfvgTrigger := true
+
+// Short Trigger: Price breaks and closes BELOW the Bullish FVG Bottom
+isShortIfvgTrigger = false
+if not na(activeBullFvgBot) and not na(lastBearSweepBar)
+    if (bar_index - lastBearSweepBar <= fvgValidityBars) and (close < activeBullFvgBot) and (close[1] >= activeBullFvgBot)
+        if htfShortOk
+            isShortIfvgTrigger := true
+
+// ==============================================================================
+// 4. STRATEGY EXECUTION & DYNAMIC RISK MANAGEMENT
+// ==============================================================================
+var float entryPrice   = na
+var float stopLoss     = na
+var float tp1Price     = na
+var float tp2Price     = na
+var float initialRisk  = na
+var bool  tp1Reached   = false
+var bool  beShifted    = false
+
+inLong  = strategy.position_size > 0
+inShort = strategy.position_size < 0
+
+// Reset state when flat
+if strategy.position_size == 0
+    entryPrice  := na
+    stopLoss    := na
+    tp1Price    := na
+    tp2Price    := na
+    initialRisk := na
+    tp1Reached  := false
+    beShifted   := false
+
+// LONG ENTRY LOGIC
+if isLongIfvgTrigger and not inLong and not inShort
+    float calculatedEntry = close
+    if entryMode == "IFVG Retest Pullback"
+        calculatedEntry := (activeBearFvgTop + activeBearFvgBot) * 0.5
+    else if entryMode == "50% Close / 50% Retest"
+        calculatedEntry := (close * 0.5) + (((activeBearFvgTop + activeBearFvgBot) * 0.5) * 0.5)
+
+    entryPrice  := calculatedEntry
+    stopLoss    := lastBullSweepLow - (slBufferAtr * atrVal)
+    initialRisk := math.max(entryPrice - stopLoss, atrVal * 0.4)
+    tp1Price    := entryPrice + (initialRisk * tp1RrRatio)
+    tp2Price    := entryPrice + (initialRisk * tp2RrRatio)
+    tp1Reached  := false
+    beShifted   := false
+
+    strategy.entry("Long_IFVG", strategy.long, comment="L-ENTRY | IFVG Inversion")
+
+    // Invalidate consumed FVG
+    activeBearFvgTop := na
+    lastBullSweepBar := na
+
+// SHORT ENTRY LOGIC
+if isShortIfvgTrigger and not inLong and not inShort
+    float calculatedEntry = close
+    if entryMode == "IFVG Retest Pullback"
+        calculatedEntry := (activeBullFvgTop + activeBullFvgBot) * 0.5
+    else if entryMode == "50% Close / 50% Retest"
+        calculatedEntry := (close * 0.5) + (((activeBullFvgTop + activeBullFvgBot) * 0.5) * 0.5)
+
+    entryPrice  := calculatedEntry
+    stopLoss    := lastBearSweepHigh + (slBufferAtr * atrVal)
+    initialRisk := math.max(stopLoss - entryPrice, atrVal * 0.4)
+    tp1Price    := entryPrice - (initialRisk * tp1RrRatio)
+    tp2Price    := entryPrice - (initialRisk * tp2RrRatio)
+    tp1Reached  := false
+    beShifted   := false
+
+    strategy.entry("Short_IFVG", strategy.short, comment="S-ENTRY | IFVG Inversion")
+
+    // Invalidate consumed FVG
+    activeBullFvgBot := na
+    lastBearSweepBar := na
+
+// TRADE MANAGEMENT & SCALED EXITS
+if inLong
+    // Check TP1
+    if high >= tp1Price and not tp1Reached
+        tp1Reached := true
+        strategy.exit("TP1_Long", "Long_IFVG", qty_percent=closePctTp1, limit=tp1Price, comment="TP1 Hit (50% Closed)")
+        if useBreakeven
+            stopLoss  := entryPrice + (beOffsetAtr * atrVal)
+            beShifted := true
+
+    // Set active Stop Loss and TP2 Runner Exit
+    strategy.exit("Exit_Long", "Long_IFVG", stop=stopLoss, limit=tp2Price, comment=beShifted ? "BE/SL Exit" : "TP2/SL Exit")
+
+if inShort
+    // Check TP1
+    if low <= tp1Price and not tp1Reached
+        tp1Reached := true
+        strategy.exit("TP1_Short", "Short_IFVG", qty_percent=closePctTp1, limit=tp1Price, comment="TP1 Hit (50% Closed)")
+        if useBreakeven
+            stopLoss  := entryPrice - (beOffsetAtr * atrVal)
+            beShifted := true
+
+    // Set active Stop Loss and TP2 Runner Exit
+    strategy.exit("Exit_Short", "Short_IFVG", stop=stopLoss, limit=tp2Price, comment=beShifted ? "BE/SL Exit" : "TP2/SL Exit")
+
+// ==============================================================================
+// 5. CHART VISUALIZATION & SHADING
+// ==============================================================================
+// Swing High & Low Liquidity Lines
+plot(showSwings ? swingHigh : na, "Buy-Side Liquidity", color=color.new(color.red, 40), linewidth=1, style=plot.style_linebr)
+plot(showSwings ? swingLow : na, "Sell-Side Liquidity", color=color.new(color.teal, 40), linewidth=1, style=plot.style_linebr)
+
+// Sweep Event Markers
+plotshape(isBullSweep, title="Bullish Liquidity Sweep", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, text="SWEEP")
+plotshape(isBearSweep, title="Bearish Liquidity Sweep", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="SWEEP")
+
+// IFVG Inversion Confirmation Signals
+plotshape(isLongIfvgTrigger, title="Bullish IFVG Inversion", style=shape.labelup, location=location.belowbar, color=color.teal, text="BUY IFVG", textcolor=color.white, size=size.normal)
+plotshape(isShortIfvgTrigger, title="Bearish IFVG Inversion", style=shape.labeldown, location=location.abovebar, color=color.purple, text="SELL IFVG", textcolor=color.white, size=size.normal)
+
+// Active Position Lines
+plot(inLong or inShort ? entryPrice : na, "Entry Price", color=color.white, linewidth=1, style=plot.style_linebr)
+plot(inLong or inShort ? stopLoss : na, "Active Stop Loss", color=color.red, linewidth=2, style=plot.style_linebr)
+plot(inLong or inShort ? tp1Price : na, "Take Profit 1", color=color.yellow, linewidth=1, style=plot.style_linebr)
+plot(inLong or inShort ? tp2Price : na, "Take Profit 2", color=color.green, linewidth=2, style=plot.style_linebr)
+
+// ==============================================================================
+// 6. REAL-TIME STRATEGY HUD DASHBOARD
+// ==============================================================================
+var table dash = table.new(dashPosition, 2, 7, bgcolor=color.new(#131722, 10), border_color=color.new(color.gray, 60), border_width=1)
+
+if barstate.islast and showDashboard
+    float winRate = strategy.closedtrades > 0 ? (strategy.wintrades / strategy.closedtrades) * 100.0 : 0.0
+    float pf = strategy.grossloss != 0 ? strategy.grossprofit / strategy.grossloss : 0.0
+    
+    table.cell(dash, 0, 0, "ICT IFVG System", bgcolor=color.new(#2962FF, 20), text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 0, "vibe-trading v3", bgcolor=color.new(#2962FF, 20), text_color=color.white, text_size=size.small)
+
+    table.cell(dash, 0, 1, "Status", text_color=color.gray, text_size=size.small)
+    string posTxt = inLong ? "LONG (Active)" : inShort ? "SHORT (Active)" : "WAITING FOR SWEEP"
+    color posCol  = inLong ? color.green : inShort ? color.red : color.gray
+    table.cell(dash, 1, 1, posTxt, text_color=posCol, text_size=size.small)
+
+    table.cell(dash, 0, 2, "Win Rate", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 2, str.tostring(winRate, "#.##") + "%", text_color=winRate >= 50 ? color.green : color.orange, text_size=size.small)
+
+    table.cell(dash, 0, 3, "Profit Factor", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 3, str.tostring(pf, "#.##"), text_color=pf >= 1.5 ? color.green : color.yellow, text_size=size.small)
+
+    table.cell(dash, 0, 4, "Total Trades", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 4, str.tostring(strategy.closedtrades), text_color=color.white, text_size=size.small)
+
+    table.cell(dash, 0, 5, "Net Profit", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 5, "$" + str.tostring(strategy.netprofit, "#.##"), text_color=strategy.netprofit >= 0 ? color.green : color.red, text_size=size.small)
+
+    table.cell(dash, 0, 6, "4H Macro Trend", text_color=color.gray, text_size=size.small)
+    string trendTxt = htfLongOk ? "BULLISH (4H)" : "BEARISH (4H)"
+    table.cell(dash, 1, 6, trendTxt, text_color=htfLongOk ? color.green : color.red, text_size=size.small)
+
+// ==============================================================================
+// 7. WEBHOOK AUTOMATION ALERTS
+// ==============================================================================
+alertcondition(isLongIfvgTrigger, title="Bullish IFVG Alert", message='{"action": "BUY", "symbol": "{{ticker}}", "price": {{close}}, "strategy": "IFVG_Sweep", "tp1_rr": 1.4, "tp2_rr": 2.8}')
+alertcondition(isShortIfvgTrigger, title="Bearish IFVG Alert", message='{"action": "SELL", "symbol": "{{ticker}}", "price": {{close}}, "strategy": "IFVG_Sweep", "tp1_rr": 1.4, "tp2_rr": 2.8}')

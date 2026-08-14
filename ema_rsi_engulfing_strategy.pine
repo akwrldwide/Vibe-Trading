@@ -1,0 +1,139 @@
+//@version=6
+strategy("Crypto Strategy (Flexible Stop Loss Engine)", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, commission_type=strategy.commission.percent, commission_value=0.06)
+
+// ==========================================
+// 1. INPUT PARAMETERS
+// ==========================================
+var string G_INDICATOR = "Indicator Settings"
+emaPeriod   = input.int(200, "EMA Period", minval=1, group=G_INDICATOR)
+rsiPeriod   = input.int(14, "RSI Period", minval=1, group=G_INDICATOR)
+rsiMidline  = input.float(50.0, "RSI Midline", group=G_INDICATOR)
+
+var string G_DIV = "RSI Divergence Settings"
+enableDiv   = input.bool(true, "Enable RSI Divergence", group=G_DIV)
+pivotRight  = input.int(5, "Pivot Lookback Right", minval=1, group=G_DIV)
+pivotLeft   = input.int(5, "Pivot Lookback Left", minval=1, group=G_DIV)
+maxRange    = input.int(30, "Max Range for Divergence Lookback", group=G_DIV)
+
+var string G_SL = "Stop Loss Calculation Settings"
+slMode       = input.string("Structure Wick + ATR Padding", "Stop Loss Calculation Method", options=["Structure Wick + ATR Padding", "Engulfing Wick + % Buffer", "ATR Distance", "2x Candle Height (Original)"], group=G_SL)
+atrMultiplier= input.float(0.35, "ATR Buffer Multiplier (for ATR Padding)", minval=0.05, step=0.05, group=G_SL)
+bufferPct    = input.float(0.15, "Wick Buffer % (for % Buffer Mode)", minval=0.01, step=0.05, group=G_SL)
+slMultiplier = input.float(2.0, "Fallback SL Multiplier (for 2x Mode)", minval=0.5, step=0.1, group=G_SL)
+rrRatio      = input.float(2.0, "Risk-to-Reward Ratio (1:X)", minval=0.5, step=0.1, group=G_SL)
+
+var string G_FILTER = "Date Range Filter"
+useDateFilter = input.bool(true, "Backtest Date Range Filter", group=G_FILTER)
+startDate     = input.time(timestamp("2022-01-01 00:00"), "Start Date", group=G_FILTER)
+endDate       = input.time(timestamp("2030-12-31 23:59"), "End Date", group=G_FILTER)
+
+inDateRange = not useDateFilter or (time >= startDate and time <= endDate)
+
+// ==========================================
+// 2. INDICATOR COMPUTATIONS
+// ==========================================
+ema200 = ta.ema(close, emaPeriod)
+rsiVal = ta.rsi(close, rsiPeriod)
+atrVal = ta.atr(14)
+
+bullEngulf = (close[1] < open[1]) and (close > open) and (close >= open[1]) and (open <= close[1])
+bearEngulf = (close[1] > open[1]) and (close < open) and (close <= open[1]) and (open >= close[1])
+
+pl = ta.pivotlow(rsiVal, pivotLeft, pivotRight)
+ph = ta.pivothigh(rsiVal, pivotLeft, pivotRight)
+
+var float lastPlRsi = na
+var float lastPlPrice = na
+var float lastPhRsi = na
+var float lastPhPrice = na
+
+bullDivDetected = false
+bearDivDetected = false
+
+if not na(pl)
+    if not na(lastPlRsi) and low[pivotRight] < lastPlPrice and rsiVal[pivotRight] > lastPlRsi
+        bullDivDetected := true
+    lastPlRsi := rsiVal[pivotRight]
+    lastPlPrice := low[pivotRight]
+
+if not na(ph)
+    if not na(lastPhRsi) and high[pivotRight] > lastPhPrice and rsiVal[pivotRight] < lastPhRsi
+        bearDivDetected := true
+    lastPhRsi := rsiVal[pivotRight]
+    lastPhPrice := high[pivotRight]
+
+var int bullDivAge = 999
+var int bearDivAge = 999
+
+bullDivAge := bullDivDetected ? 0 : bullDivAge + 1
+bearDivAge := bearDivDetected ? 0 : bearDivAge + 1
+
+hasBullDiv = bullDivAge <= maxRange
+hasBearDiv = bearDivAge <= maxRange
+
+// Signals
+longCondition  = (close > ema200) and ((rsiVal > rsiMidline) or (enableDiv and hasBullDiv)) and bullEngulf and inDateRange
+shortCondition = (close < ema200) and ((rsiVal < rsiMidline) or (enableDiv and hasBearDiv)) and bearEngulf and inDateRange
+
+// ==========================================
+// 3. FLEXIBLE DYNAMIC STOP LOSS CALCULATION
+// ==========================================
+candleLen = high - low
+
+var float longSL = na
+var float longTP = na
+var float shortSL = na
+var float shortTP = na
+
+if longCondition and strategy.position_size == 0
+    if slMode == "Structure Wick + ATR Padding"
+        // Min of current low and previous low minus ATR buffer
+        minLow = math.min(low, low[1])
+        longSL := minLow - (atrVal * atrMultiplier)
+    else if slMode == "Engulfing Wick + % Buffer"
+        longSL := low * (1.0 - bufferPct / 100.0)
+    else if slMode == "ATR Distance"
+        longSL := close - (atrVal * 1.0)
+    else // "2x Candle Height (Original)"
+        longSL := close - (candleLen * slMultiplier)
+    
+    longRisk = close - longSL
+    if longRisk > 0
+        longTP := close + (longRisk * rrRatio)
+        strategy.entry("Long", strategy.long)
+        strategy.exit("Exit Long", "Long", stop=longSL, limit=longTP)
+
+if shortCondition and strategy.position_size == 0
+    if slMode == "Structure Wick + ATR Padding"
+        maxHigh = math.max(high, high[1])
+        shortSL := maxHigh + (atrVal * atrMultiplier)
+    else if slMode == "Engulfing Wick + % Buffer"
+        shortSL := high * (1.0 + bufferPct / 100.0)
+    else if slMode == "ATR Distance"
+        shortSL := close + (atrVal * 1.0)
+    else
+        shortSL := close + (candleLen * slMultiplier)
+    
+    shortRisk = shortSL - close
+    if shortRisk > 0
+        shortTP := close - (shortRisk * rrRatio)
+        strategy.entry("Short", strategy.short)
+        strategy.exit("Exit Short", "Short", stop=shortSL, limit=shortTP)
+
+if strategy.position_size == 0
+    longSL := na
+    longTP := na
+    shortSL := na
+    shortTP := na
+
+// Visuals
+plot(ema200, "200 EMA", color=color.orange, linewidth=2)
+plotshape(longCondition and strategy.position_size[1] == 0, "Buy Signal", shape.triangleup, location.belowbar, color=color.green, size=size.small, text="BUY")
+plotshape(shortCondition and strategy.position_size[1] == 0, "Sell Signal", shape.triangledown, location.abovebar, color=color.red, size=size.small, text="SELL")
+
+barcolor(bullEngulf ? color.new(color.teal, 30) : bearEngulf ? color.new(color.maroon, 30) : na)
+
+plot(strategy.position_size > 0 ? longSL : na, "Long SL", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size > 0 ? longTP : na, "Long TP", color=color.green, style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size < 0 ? shortSL : na, "Short SL", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size < 0 ? shortTP : na, "Short TP", color=color.green, style=plot.style_linebr, linewidth=2)

@@ -1,0 +1,390 @@
+//@version=6
+strategy("Top-Down Crypto Liquidity & MSS Strategy [Clean UI v7 - Alerts & Visual Levels]", 
+         overlay=true, 
+         initial_capital=100000, 
+         default_qty_type=strategy.percent_of_equity, 
+         default_qty_value=10, 
+         commission_type=strategy.commission.percent, 
+         commission_value=0.05, 
+         slippage=3,
+         max_boxes_count=150,
+         max_lines_count=150,
+         max_labels_count=150)
+
+// ==============================================================================
+// 1. USER INPUTS & PREFERENCES
+// ==============================================================================
+group_htf        = "1. Higher Timeframe (4H) Macro Filter"
+useHtfFilter     = input.bool(true, "Enable 4H Trend Filter (Avoid Counter-Trend)", group=group_htf, tooltip="When enabled, only takes Longs above 4H EMA and Shorts below 4H EMA")
+htfRes           = input.timeframe("240", "HTF Timeframe", group=group_htf)
+htfEmaPeriod     = input.int(50, "HTF Trend EMA Length", minval=10, group=group_htf)
+
+group_liq        = "2. Liquidity & Sweep Engine"
+swingLookback    = input.int(32, "Swing High/Low Lookback (Bars)", minval=10, maxval=100, group=group_liq)
+sweepWickPct     = input.float(0.20, "Min Rejection Wick (% of Bar Range)", minval=0.05, step=0.05, group=group_liq)
+useVolFilter     = input.bool(true, "Require Volume Spike on Sweep", group=group_liq)
+volMult          = input.float(1.05, "Volume Multiplier vs 20 SMA", step=0.05, group=group_liq)
+
+group_exec       = "3. Entry & Stop Loss Engine"
+entryMode        = input.string("50% FVG Retest Limit", "Execution Mode", options=["Market on MSS Close (Replay-Friendly)", "50% FVG Retest Limit"], group=group_exec)
+orderExpiryBars  = input.int(10, "Pending Order Expiration (Max Bars)", minval=1, maxval=30, group=group_exec, tooltip="Cancels pending limit order if not filled within X bars (avoids stale/adverse fills)")
+cancelOnTpHit    = input.bool(true, "Cancel if Target (TP) Hit First", group=group_exec, tooltip="If price runs straight to TP target before pulling back to fill, setup is invalidated")
+slBufferAtr      = input.float(1.0, "Stop Loss Padding (ATR Mult)", minval=0.1, step=0.1, group=group_exec, tooltip="1.0 - 1.5 ATR padding prevents premature stop-outs from crypto retest wicks")
+tp1RrRatio       = input.float(1.1, "TP1 Target (RR Ratio)", minval=0.5, step=0.1, group=group_exec)
+tp2RrRatio       = input.float(2.5, "TP2 Target (RR Ratio)", minval=1.0, step=0.1, group=group_exec)
+useBreakeven     = input.bool(false, "Move SL to Breakeven after TP1 Hit", group=group_exec)
+
+group_ui         = "4. Clean Chart Visuals & Display"
+showTradeLevels  = input.bool(true, "Draw Entry / SL / TP Chart Lines & Labels", group=group_ui)
+showHtfEma       = input.bool(true, "Show 4H HTF EMA Line", group=group_ui)
+showKeyLevels    = input.bool(false, "Show Historical Swing Dot Tracks", group=group_ui, tooltip="Keep off to keep chart clean")
+showPdhPdl       = input.bool(true, "Show Daily High/Low (PDH/PDL)", group=group_ui)
+showAsianRange   = input.bool(false, "Highlight Asian Session Background", group=group_ui)
+showDashboard    = input.bool(true, "Show Strategy HUD Dashboard", group=group_ui)
+dashPosition     = input.string(position.top_right, "HUD Position", options=[position.top_right, position.bottom_right, position.top_left, position.bottom_left], group=group_ui)
+
+group_webhook    = "5. Webhook Settings"
+webhookPasscode  = input.string("MY_SECRET_PASSCODE", "Webhook Passcode", group=group_webhook)
+
+// ==============================================================================
+// 2. INDICATORS & 4H TREND CALCULATIONS
+// ==============================================================================
+atrVal = ta.atr(14)
+volSma = ta.sma(volume, 20)
+volOk  = not useVolFilter or (volume >= volSma * volMult)
+
+htfClose = request.security(syminfo.tickerid, htfRes, close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+htfEma   = request.security(syminfo.tickerid, htfRes, ta.ema(close, htfEmaPeriod), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+htfBullish = not useHtfFilter or (htfClose >= htfEma)
+htfBearish = not useHtfFilter or (htfClose <= htfEma)
+
+plot(showHtfEma ? htfEma : na, "4H 50 EMA", color=htfBullish ? color.new(color.teal, 30) : color.new(color.maroon, 30), linewidth=2)
+
+// ==============================================================================
+// 3. CLEAN REFERENCE LEVELS (PDH/PDL & SWINGS)
+// ==============================================================================
+pdh = request.security(syminfo.tickerid, "D", high[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+pdl = request.security(syminfo.tickerid, "D", low[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+swingHigh = ta.highest(high, swingLookback)[1]
+swingLow  = ta.lowest(low, swingLookback)[1]
+
+plot(showPdhPdl ? pdh : na, "PDH", color=color.new(color.orange, 50), style=plot.style_linebr, linewidth=1)
+plot(showPdhPdl ? pdl : na, "PDL", color=color.new(color.blue, 50), style=plot.style_linebr, linewidth=1)
+
+plot(showKeyLevels ? swingHigh : na, "Swing High", color=color.new(color.red, 70), style=plot.style_circles)
+plot(showKeyLevels ? swingLow : na, "Swing Low", color=color.new(color.green, 70), style=plot.style_circles)
+
+isAsian = (hour(time, "UTC") >= 0) and (hour(time, "UTC") < 8)
+bgcolor(showAsianRange and isAsian ? color.new(color.purple, 95) : na, title="Asian Session")
+
+// ==============================================================================
+// 4. CLEAN LIQUIDITY SWEEP & MSS TRIGGER
+// ==============================================================================
+barRange  = math.max(high - low, syminfo.mintick)
+lowerWick = math.min(open, close) - low
+upperWick = high - math.max(open, close)
+
+sweptBull = (low < pdl) or (low < swingLow)
+closedBull = (close >= pdl) or (close >= swingLow) or (lowerWick / barRange >= sweepWickPct)
+isBullSweepRaw = sweptBull and closedBull and volOk and htfBullish
+
+sweptBear = (high > pdh) or (high > swingHigh)
+closedBear = (close <= pdh) or (close <= swingHigh) or (upperWick / barRange >= sweepWickPct)
+isBearSweepRaw = sweptBear and closedBear and volOk and htfBearish
+
+var int lastBullSweepBar = na
+var int lastBearSweepBar = na
+
+isBullSweep = isBullSweepRaw and (na(lastBullSweepBar) or (bar_index - lastBullSweepBar > 5))
+isBearSweep = isBearSweepRaw and (na(lastBearSweepBar) or (bar_index - lastBearSweepBar > 5))
+
+if isBullSweep
+    lastBullSweepBar := bar_index
+if isBearSweep
+    lastBearSweepBar := bar_index
+
+plotshape(isBullSweep, title="Bullish Liquidity Sweep", style=shape.triangleup, location=location.belowbar, color=color.teal, size=size.tiny)
+plotshape(isBearSweep, title="Bearish Liquidity Sweep", style=shape.triangledown, location=location.abovebar, color=color.maroon, size=size.tiny)
+
+isBullFvg = (low > high[2])
+bullFvgCe = (high[2] + low) / 2.0
+
+isBearFvg = (high < low[2])
+bearFvgCe = (low[2] + high) / 2.0
+
+var int sweepBar = na
+var string sweepType = "NONE"
+var float sweepExtreme = na
+
+if isBullSweep
+    sweepBar := bar_index
+    sweepType := "BULL"
+    sweepExtreme := low
+
+if isBearSweep
+    sweepBar := bar_index
+    sweepType := "BEAR"
+    sweepExtreme := high
+
+barsSince = bar_index - sweepBar
+validWindow = not na(sweepBar) and (barsSince >= 1) and (barsSince <= 12)
+
+localHigh = ta.highest(high, 5)[1]
+localLow  = ta.lowest(low, 5)[1]
+
+bullMss = validWindow and (sweepType == "BULL") and (close > localHigh) and isBullFvg and htfBullish
+bearMss = validWindow and (sweepType == "BEAR") and (close < localLow) and isBearFvg and htfBearish
+
+// ==============================================================================
+// 5. PENDING ORDER, EXPIRATION & VISUAL TRADE LEVELS
+// ==============================================================================
+var bool  pendingLongActive  = false
+var bool  pendingShortActive = false
+var int   pendingOrderBar    = na
+var float pendingEntry       = na
+var float pendingSl          = na
+var float pendingTp1         = na
+var float pendingTp2         = na
+
+var float activeEntry = na
+var float activeSl    = na
+var float activeTp1   = na
+var float activeTp2   = na
+var bool  tp1Hit      = false
+
+// Drawing tracking lines & labels
+var line  lineEntry = na
+var line  lineSl    = na
+var line  lineTp1   = na
+var line  lineTp2   = na
+var label lblEntry  = na
+var label lblSl     = na
+var label lblTp2    = na
+
+// Alert trigger booleans
+var bool alertLongSignal  = false
+var bool alertShortSignal = false
+var bool alertOrderFilled = false
+var bool alertTp1Hit      = false
+var bool alertCancelled   = false
+
+alertLongSignal  := false
+alertShortSignal := false
+alertOrderFilled := false
+alertTp1Hit      := false
+alertCancelled   := false
+
+// 1. Long Entry Setup
+if bullMss and strategy.position_size == 0 and not pendingLongActive
+    calcEntry = (entryMode == "Market on MSS Close (Replay-Friendly)") ? close : bullFvgCe
+    calcSl    = sweepExtreme - (atrVal * slBufferAtr)
+    riskDist  = calcEntry - calcSl
+    
+    if riskDist > 0
+        alertLongSignal := true
+        if entryMode == "Market on MSS Close (Replay-Friendly)"
+            activeEntry := calcEntry
+            activeSl    := calcSl
+            activeTp1   := calcEntry + (riskDist * tp1RrRatio)
+            activeTp2   := calcEntry + (riskDist * tp2RrRatio)
+            tp1Hit      := false
+            strategy.entry("Long", strategy.long)
+        else
+            pendingEntry       := calcEntry
+            pendingSl          := calcSl
+            pendingTp1         := calcEntry + (riskDist * tp1RrRatio)
+            pendingTp2         := calcEntry + (riskDist * tp2RrRatio)
+            pendingOrderBar    := bar_index
+            pendingLongActive  := true
+            strategy.entry("Long", strategy.long, limit=pendingEntry)
+            
+        // Draw Visual Lines & Labels for Entry, SL, TP1, and TP2
+        if showTradeLevels
+            targetEntry = (entryMode == "Market on MSS Close (Replay-Friendly)") ? activeEntry : pendingEntry
+            targetSl    = (entryMode == "Market on MSS Close (Replay-Friendly)") ? activeSl : pendingSl
+            targetTp1   = (entryMode == "Market on MSS Close (Replay-Friendly)") ? activeTp1 : pendingTp1
+            targetTp2   = (entryMode == "Market on MSS Close (Replay-Friendly)") ? activeTp2 : pendingTp2
+            
+            lineEntry := line.new(bar_index, targetEntry, bar_index + orderExpiryBars + 15, targetEntry, color=color.blue, width=2)
+            lineSl    := line.new(bar_index, targetSl, bar_index + orderExpiryBars + 15, targetSl, color=color.red, width=2)
+            lineTp1   := line.new(bar_index, targetTp1, bar_index + orderExpiryBars + 15, targetTp1, color=color.green, width=1, style=line.style_dashed)
+            lineTp2   := line.new(bar_index, targetTp2, bar_index + orderExpiryBars + 15, targetTp2, color=color.green, width=2)
+            
+            lblEntry  := label.new(bar_index + 2, targetEntry, "BUY @" + str.tostring(targetEntry, "#.##"), color=color.blue, textcolor=color.white, size=size.small, style=label.style_label_down)
+            lblSl     := label.new(bar_index + 2, targetSl, "SL @" + str.tostring(targetSl, "#.##"), color=color.red, textcolor=color.white, size=size.small, style=label.style_label_up)
+            lblTp2    := label.new(bar_index + 2, targetTp2, "TP @" + str.tostring(targetTp2, "#.##") + " (1:" + str.tostring(tp2RrRatio, "#.#") + ")", color=color.green, textcolor=color.white, size=size.small, style=label.style_label_down)
+        sweepBar := na
+
+// 2. Short Entry Setup
+if bearMss and strategy.position_size == 0 and not pendingShortActive
+    calcEntry = (entryMode == "Market on MSS Close (Replay-Friendly)") ? close : bearFvgCe
+    calcSl    = sweepExtreme + (atrVal * slBufferAtr)
+    riskDist  = calcSl - calcEntry
+    
+    if riskDist > 0
+        alertShortSignal := true
+        if entryMode == "Market on MSS Close (Replay-Friendly)"
+            activeEntry := calcEntry
+            activeSl    := calcSl
+            activeTp1   := calcEntry - (riskDist * tp1RrRatio)
+            activeTp2   := calcEntry - (riskDist * tp2RrRatio)
+            tp1Hit      := false
+            strategy.entry("Short", strategy.short)
+        else
+            pendingEntry        := calcEntry
+            pendingSl           := calcSl
+            pendingTp1          := calcEntry - (riskDist * tp1RrRatio)
+            pendingTp2          := calcEntry - (riskDist * tp2RrRatio)
+            pendingOrderBar     := bar_index
+            pendingShortActive  := true
+            strategy.entry("Short", strategy.short, limit=pendingEntry)
+            
+        if showTradeLevels
+            targetEntry = (entryMode == "Market on MSS Close (Replay-Friendly)") ? activeEntry : pendingEntry
+            targetSl    = (entryMode == "Market on MSS Close (Replay-Friendly)") ? activeSl : pendingSl
+            targetTp1   = (entryMode == "Market on MSS Close (Replay-Friendly)") ? activeTp1 : pendingTp1
+            targetTp2   = (entryMode == "Market on MSS Close (Replay-Friendly)") ? activeTp2 : pendingTp2
+            
+            lineEntry := line.new(bar_index, targetEntry, bar_index + orderExpiryBars + 15, targetEntry, color=color.blue, width=2)
+            lineSl    := line.new(bar_index, targetSl, bar_index + orderExpiryBars + 15, targetSl, color=color.red, width=2)
+            lineTp1   := line.new(bar_index, targetTp1, bar_index + orderExpiryBars + 15, targetTp1, color=color.green, width=1, style=line.style_dashed)
+            lineTp2   := line.new(bar_index, targetTp2, bar_index + orderExpiryBars + 15, targetTp2, color=color.green, width=2)
+            
+            lblEntry  := label.new(bar_index + 2, targetEntry, "SELL @" + str.tostring(targetEntry, "#.##"), color=color.blue, textcolor=color.white, size=size.small, style=label.style_label_up)
+            lblSl     := label.new(bar_index + 2, targetSl, "SL @" + str.tostring(targetSl, "#.##"), color=color.red, textcolor=color.white, size=size.small, style=label.style_label_down)
+            lblTp2    := label.new(bar_index + 2, targetTp2, "TP @" + str.tostring(targetTp2, "#.##") + " (1:" + str.tostring(tp2RrRatio, "#.#") + ")", color=color.green, textcolor=color.white, size=size.small, style=label.style_label_up)
+        sweepBar := na
+
+// 3. Manage Pending Long Expiration & Invalidation
+if pendingLongActive and strategy.position_size == 0
+    barsWaiting = bar_index - pendingOrderBar
+    
+    if cancelOnTpHit and (high >= pendingTp1)
+        strategy.cancel("Long")
+        pendingLongActive := false
+        alertCancelled := true
+        if showTradeLevels
+            label.new(bar_index, high, "INVALIDATED (TP HIT FIRST)", color=color.orange, textcolor=color.white, size=size.small, style=label.style_label_down)
+            
+    else if barsWaiting >= orderExpiryBars
+        strategy.cancel("Long")
+        pendingLongActive := false
+        alertCancelled := true
+        if showTradeLevels
+            label.new(bar_index, high, "EXPIRED (" + str.tostring(barsWaiting) + " bars)", color=color.gray, textcolor=color.white, size=size.small, style=label.style_label_down)
+            
+    else if low <= pendingSl
+        strategy.cancel("Long")
+        pendingLongActive := false
+        alertCancelled := true
+        if showTradeLevels
+            label.new(bar_index, low, "CANCELLED (SL HIT)", color=color.red, textcolor=color.white, size=size.small, style=label.style_label_up)
+
+// 4. Manage Pending Short Expiration & Invalidation
+if pendingShortActive and strategy.position_size == 0
+    barsWaiting = bar_index - pendingOrderBar
+    
+    if cancelOnTpHit and (low <= pendingTp1)
+        strategy.cancel("Short")
+        pendingShortActive := false
+        alertCancelled := true
+        if showTradeLevels
+            label.new(bar_index, low, "INVALIDATED (TP HIT FIRST)", color=color.orange, textcolor=color.white, size=size.small, style=label.style_label_up)
+            
+    else if barsWaiting >= orderExpiryBars
+        strategy.cancel("Short")
+        pendingShortActive := false
+        alertCancelled := true
+        if showTradeLevels
+            label.new(bar_index, low, "EXPIRED (" + str.tostring(barsWaiting) + " bars)", color=color.gray, textcolor=color.white, size=size.small, style=label.style_label_up)
+            
+    else if high >= pendingSl
+        strategy.cancel("Short")
+        pendingShortActive := false
+        alertCancelled := true
+        if showTradeLevels
+            label.new(bar_index, high, "CANCELLED (SL HIT)", color=color.red, textcolor=color.white, size=size.small, style=label.style_label_down)
+
+// 5. Active Position Management & Exits
+if strategy.position_size > 0
+    if pendingLongActive
+        activeEntry := pendingEntry
+        activeSl    := pendingSl
+        activeTp1   := pendingTp1
+        activeTp2   := pendingTp2
+        tp1Hit      := false
+        pendingLongActive := false
+        alertOrderFilled  := true
+        
+    if not tp1Hit and (high >= activeTp1)
+        tp1Hit := true
+        alertTp1Hit := true
+        strategy.exit("TP1", from_entry="Long", qty_percent=50, limit=activeTp1)
+        if useBreakeven
+            activeSl := activeEntry
+            
+    strategy.exit("Runner", from_entry="Long", limit=activeTp2, stop=activeSl)
+
+else if strategy.position_size < 0
+    if pendingShortActive
+        activeEntry := pendingEntry
+        activeSl    := pendingSl
+        activeTp1   := pendingTp1
+        activeTp2   := pendingTp2
+        tp1Hit      := false
+        pendingShortActive := false
+        alertOrderFilled  := true
+        
+    if not tp1Hit and (low <= activeTp1)
+        tp1Hit := true
+        alertTp1Hit := true
+        strategy.exit("TP1", from_entry="Short", qty_percent=50, limit=activeTp1)
+        if useBreakeven
+            activeSl := activeEntry
+            
+    strategy.exit("Runner", from_entry="Short", limit=activeTp2, stop=activeSl)
+
+// ==============================================================================
+// 6. HUD DASHBOARD (REPLAY & LIVE COMPATIBLE)
+// ==============================================================================
+if showDashboard
+    var table hud = table.new(dashPosition, 2, 6, bgcolor=color.new(color.black, 20), border_color=color.gray, border_width=1)
+    
+    table.cell(hud, 0, 0, "CRYPTO HUD", bgcolor=color.purple, text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 0, "STATUS", bgcolor=color.purple, text_color=color.white, text_size=size.small)
+    
+    table.cell(hud, 0, 1, "4H Macro Bias:", text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 1, htfBullish ? "BULLISH 🟢" : "BEARISH 🔴", text_color=htfBullish ? color.green : color.red, text_size=size.small)
+    
+    posStatus = strategy.position_size > 0 ? "LONG 🟢" : (strategy.position_size < 0 ? "SHORT 🔴" : (pendingLongActive or pendingShortActive ? "PENDING LIMIT ⏳" : "FLAT ⚪"))
+    table.cell(hud, 0, 2, "Active State:", text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 2, posStatus, text_color=color.white, text_size=size.small)
+    
+    table.cell(hud, 0, 3, "Breakeven Active:", text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 3, tp1Hit ? "LOCKED 🔒" : "NO ⏳", text_color=tp1Hit ? color.yellow : color.gray, text_size=size.small)
+    
+    winCount = strategy.wintrades
+    totalClosed = strategy.closedtrades
+    wrPct = totalClosed > 0 ? (winCount / totalClosed * 100) : 0.0
+    table.cell(hud, 0, 4, "Win Rate:", text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 4, str.tostring(wrPct, "#.#") + "% (" + str.tostring(winCount) + "/" + str.tostring(totalClosed) + ")", text_color=color.white, text_size=size.small)
+    
+    table.cell(hud, 0, 5, "Net Profit:", text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 5, "$" + str.tostring(strategy.netprofit, "#.##"), text_color=strategy.netprofit >= 0 ? color.green : color.red, text_size=size.small)
+
+// ==============================================================================
+// 7. TRADINGVIEW NATIVE ALERTS & WEBHOOK PAYLOADS
+// ==============================================================================
+// Native 1-Click Alert Conditions (for TradingView popup alerts / phone push)
+alertcondition(alertLongSignal, title="1. MSS Buy Setup Formed (Long)", message="🟢 [BUY SIGNAL] {{ticker}} MSS Long Setup! Entry Limit: {{plot_0}}")
+alertcondition(alertShortSignal, title="2. MSS Sell Setup Formed (Short)", message="🔴 [SELL SIGNAL] {{ticker}} MSS Short Setup! Entry Limit: {{plot_0}}")
+alertcondition(alertOrderFilled, title="3. Limit Order Filled", message="🚀 [FILLED] {{ticker}} limit order filled! Position is now open.")
+alertcondition(alertTp1Hit, title="4. TP1 Target Hit (50% Closed)", message="🎯 [TP1 HIT] {{ticker}} reached TP1 target! 50% locked in.")
+alertcondition(alertCancelled, title="5. Order Cancelled / Expired", message="⚠️ [CANCELLED] {{ticker}} pending order was cancelled or expired.")
+
+// Dynamic Alert function for webhook bots / bridges
+alertPayload = '{"passcode":"' + webhookPasscode + '","symbol":"' + syminfo.ticker + '","action":"' + (alertLongSignal ? "BUY" : (alertShortSignal ? "SELL" : "UPDATE")) + '","entry":' + str.tostring(activeEntry, "#.##") + ',"sl":' + str.tostring(activeSl, "#.##") + ',"tp":' + str.tostring(activeTp2, "#.##") + '}'
+if alertLongSignal or alertShortSignal
+    alert(alertPayload, alert.freq_once_per_bar_close)

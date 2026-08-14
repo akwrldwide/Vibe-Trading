@@ -5,17 +5,20 @@ indicator("9:30 NY Open 1m ICT FVG (Alpaca Bugfixed)", overlay=true, max_boxes_c
 // INPUT PARAMETERS
 // ============================================================================
 passcode                 = input.string("MY_SECRET_PASSCODE", "Webhook Passcode", group="Webhook Settings")
-use_htf_filter           = input.bool(true, "Use 1H HTF Trend Filter", group="Strategy Parameters")
+use_htf_filter           = input.bool(true, "Use HTF Trend Filter", group="Strategy Parameters")
+htf_tf                   = input.timeframe("15", "HTF Trend Bias Timeframe", group="Strategy Parameters")
 ignore_news_guard        = input.bool(false, "Overlook News Window (09:55-10:05)", group="Strategy Parameters")
 cancel_on_opposite_break = input.bool(true, "Cancel Pending Order on Opposite OR Break", group="Strategy Parameters")
+use_mid_invalidation     = input.bool(true, "Invalidate Direction on Range Midpoint Re-entry", group="Strategy Parameters")
 sl_mode                  = input.string("3-Bar FVG Swing Low/High", "Stop Loss Mode", options=["3-Bar FVG Swing Low/High", "4-Bar Swing Low/High", "FVG Gap Edge", "Fixed Pips"], group="Strategy Parameters")
 fixed_sl_pips            = input.float(3.0, "Fixed SL Pips (if Fixed Pips selected)", minval=1.0, step=0.5, group="Strategy Parameters")
 rr_ratio                 = input.float(2.0, "Risk:Reward Ratio", minval=0.5, step=0.5, group="Strategy Parameters")
-htf_ema_period           = input.int(50, "1H HTF EMA Period", minval=10, group="Strategy Parameters")
+htf_ema_period           = input.int(50, "HTF EMA Period", minval=10, group="Strategy Parameters")
 sl_buffer_val            = input.float(1.0, "SL Buffer (Pips/Points)", minval=0.0, step=0.5, group="Strategy Parameters")
 min_fvg_val              = input.float(0.3, "Min FVG Size (Pips/Points)", minval=0.0, step=0.1, group="Strategy Parameters")
 box_width_bars           = input.int(30, "Signal Box Width (Bars)", minval=10, maxval=100, group="Visuals")
-show_htf_ema             = input.bool(true, "Show 1H HTF EMA Line", group="Visuals")
+show_htf_ema             = input.bool(true, "Show HTF EMA Line", group="Visuals")
+show_or_mid              = input.bool(false, "Show 15m OR Midpoint Line", group="Visuals")
 show_trade_levels        = input.bool(true, "Show Entry / SL / TP Chart Lines & Labels", group="Visuals")
 show_table               = input.bool(true, "Show Status Table", group="Visuals")
 table_pos                = input.string("Top Right", "Table Position", options=["Top Right", "Bottom Right", "Top Left", "Bottom Left"], group="Visuals")
@@ -44,6 +47,10 @@ is_new_day     = not na(ny_day_change) and ny_day_change != 0
 // ============================================================================
 var float or_high = na
 var float or_low  = na
+var bool or_broken_above = false
+var bool or_broken_below = false
+var bool long_invalidated  = false
+var bool short_invalidated = false
 var bool session_trade_taken = false
 var bool pending_order_active = false
 var bool trade_completed = false
@@ -52,6 +59,10 @@ var int current_signal = 0 // 1 = Buy, -1 = Sell, 0 = None
 if is_new_day
     or_high := na
     or_low  := na
+    or_broken_above := false
+    or_broken_below := false
+    long_invalidated  := false
+    short_invalidated := false
     session_trade_taken := false
     pending_order_active := false
     trade_completed := false
@@ -63,17 +74,19 @@ if is_or_window
     if na(or_low) or low < or_low
         or_low := low
 
+or_mid = not na(or_high) and not na(or_low) ? (or_high + or_low) / 2.0 : na
+
 // ============================================================================
-// 1H HTF EMA TREND BIAS & PLOT
+// HTF EMA TREND BIAS & PLOT (NON-REPAINTING SYNCHRONIZATION)
 // ============================================================================
-ema50 = ta.ema(close, htf_ema_period)
-htf_close = request.security(syminfo.tickerid, "60", close, barmerge.gaps_off, barmerge.lookahead_off)
-htf_ema   = request.security(syminfo.tickerid, "60", ema50, barmerge.gaps_off, barmerge.lookahead_off)
+// Calculate HTF close and HTF EMA on completed higher-timeframe bar [1] to eliminate repainting & sync live with history
+htf_close = request.security(syminfo.tickerid, htf_tf, close[1], barmerge.gaps_off, barmerge.lookahead_off)
+htf_ema   = request.security(syminfo.tickerid, htf_tf, ta.ema(close, htf_ema_period)[1], barmerge.gaps_off, barmerge.lookahead_off)
 is_htf_bullish = htf_close > htf_ema
 is_htf_bearish = htf_close < htf_ema
 
-// Visible 1H HTF EMA Plot line
-plot(show_htf_ema ? htf_ema : na, "1H HTF EMA Line", color=color.orange, linewidth=2)
+// Visible HTF EMA Plot line
+plot(show_htf_ema ? htf_ema : na, "HTF EMA Line", color=color.orange, linewidth=2)
 
 // ============================================================================
 // 1m FAIR VALUE GAP (FVG) DETECTION
@@ -101,6 +114,42 @@ fvg_bearish_ce = (low[2] + high) / 2.0
 // ============================================================================
 is_above_or = not na(or_high) and close > or_high
 is_below_or = not na(or_low) and close < or_low
+
+// Track if OR has been broken out during the trade window (mutually exclusive)
+if is_trade_window
+    if is_above_or
+        or_broken_above := true
+        or_broken_below := false
+    if is_below_or
+        or_broken_below := true
+        or_broken_above := false
+
+// Directional Invalidation on Range Midpoint Re-entry (Option 1: Kill failed side, allow opposite break)
+if is_trade_window and use_mid_invalidation and not na(or_mid)
+    // If low was broken/swept, but price rallies back above 50% midpoint, kill further short setups
+    if (or_broken_below or is_below_or) and close > or_mid
+        short_invalidated := true
+        or_broken_below   := false
+    // If high was broken/swept, but price drops back below 50% midpoint, kill further long setups
+    if (or_broken_above or is_above_or) and close < or_mid
+        long_invalidated  := true
+        or_broken_above   := false
+
+// Bullish Qualification:
+// 1. Must be trading strictly ABOVE or_high (cannot buy below the range)
+// 2. Breakout candle is 2nd candle [1] OR FVG formed after breakout
+// 3. Direction must not be invalidated by a prior failed high sweep
+bullish_breakout_on_candle_2 = not na(or_high) and (close[1] > or_high or high[1] > or_high)
+is_in_bullish_zone           = not na(or_high) and (close > or_high or close[1] > or_high)
+is_valid_bullish_setup       = is_fvg_bullish and is_in_bullish_zone and (bullish_breakout_on_candle_2 or or_broken_above[1]) and not (use_mid_invalidation and long_invalidated)
+
+// Bearish Qualification:
+// 1. Must be trading strictly BELOW or_low (cannot sell above the range)
+// 2. Breakout candle is 2nd candle [1] OR FVG formed after breakout
+// 3. Direction must not be invalidated by a prior failed low sweep
+bearish_breakout_on_candle_2 = not na(or_low) and (close[1] < or_low or low[1] < or_low)
+is_in_bearish_zone           = not na(or_low) and (close < or_low or close[1] < or_low)
+is_valid_bearish_setup       = is_fvg_bearish and is_in_bearish_zone and (bearish_breakout_on_candle_2 or or_broken_below[1]) and not (use_mid_invalidation and short_invalidated)
 
 long_htf_ok  = not use_htf_filter or is_htf_bullish
 short_htf_ok = not use_htf_filter or is_htf_bearish
@@ -150,7 +199,7 @@ if pending_order_active and not trade_completed and cancel_on_opposite_break
 
 if is_valid_time and not session_trade_taken
     // Bullish Long Signal
-    if is_above_or and is_fvg_bullish and long_htf_ok
+    if is_valid_bullish_setup and long_htf_ok
         entry = fvg_bullish_ce
         
         // SL calculation based on sl_mode
@@ -207,7 +256,7 @@ if is_valid_time and not session_trade_taken
             alert(buy_json, alert.freq_once_per_bar_close)
 
     // Bearish Short Signal
-    else if is_below_or and is_fvg_bearish and short_htf_ok
+    else if is_valid_bearish_setup and short_htf_ok
         entry = fvg_bearish_ce
         
         // SL calculation based on sl_mode
@@ -268,9 +317,11 @@ if is_valid_time and not session_trade_taken
 // ============================================================================
 plot_or_high = is_full_session ? or_high : na
 plot_or_low  = is_full_session ? or_low  : na
+plot_or_mid  = is_full_session and show_or_mid ? or_mid  : na
 
 plot(plot_or_high, "15m OR High", color=color.green, linewidth=2, style=plot.style_linebr)
 plot(plot_or_low,  "15m OR Low",  color=color.red,   linewidth=2, style=plot.style_linebr)
+plot(plot_or_mid,  "15m OR Midpoint", color=color.new(color.gray, 30), linewidth=1, style=plot.style_linebr)
 
 plotshape(buy_signal, title="BUY Signal Triangle", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small)
 plotshape(sell_signal, title="SELL Signal Triangle", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)
@@ -296,7 +347,7 @@ if show_table and barstate.islast
     table.cell(status_tbl, 0, 0, "9:30 NY ICT SETUP", bgcolor=color.purple, text_color=color.white, text_size=size.small)
     table.cell(status_tbl, 1, 0, setup_str, bgcolor=setup_bg, text_color=color.white, text_size=size.small)
 
-    table.cell(status_tbl, 0, 1, "1H HTF Bias", bgcolor=label_cell_bg, text_color=color.white, text_size=size.small)
+    table.cell(status_tbl, 0, 1, "HTF Bias (" + htf_tf + ")", bgcolor=label_cell_bg, text_color=color.white, text_size=size.small)
     htf_bias_text = not use_htf_filter ? (is_htf_bullish ? "BULLISH (OFF)" : "BEARISH (OFF)") : (is_htf_bullish ? "BULLISH" : "BEARISH")
     table.cell(status_tbl, 1, 1, htf_bias_text, bgcolor=is_htf_bullish ? color.green : color.red, text_color=color.white, text_size=size.small)
 
