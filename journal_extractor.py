@@ -4,7 +4,9 @@ import json
 import logging
 from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime, timezone
-from PIL import Image, ImageEnhance, ImageOps
+import cv2
+import numpy as np
+from PIL import Image, ImageEnhance
 import io
 
 logger = logging.getLogger(__name__)
@@ -42,7 +44,11 @@ def save_uploaded_image(file_bytes: bytes, filename: str) -> str:
 def extract_trade_info_from_image(file_bytes: bytes, filename: str) -> Dict[str, Any]:
     """
     Extracts 9:30 NY ICT setup details from a TradingView screenshot.
-    Uses multi-pass Local EasyOCR with benchmark price scale anchoring & mathematical level resolution.
+    Uses multi-stage detection:
+    1. HSV Color-Segmented Badge Detection (Red=SL, Blue=ENTRY, Green=TP)
+    2. OCR on Status Table & Header Bar (Symbol, Action, HTF Bias, Date, Time)
+    3. Scale Alignment & Mathematical Validation
+    4. Cloud AI fallback if API keys provided
     """
     screenshot_url = save_uploaded_image(file_bytes, filename)
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -64,42 +70,59 @@ def extract_trade_info_from_image(file_bytes: bytes, filename: str) -> Dict[str,
         "confidence": "ocr_local"
     }
 
-    # 1. Multi-pass Local EasyOCR
     reader = get_ocr_reader()
     if reader:
         try:
-            # Pass A: Full image OCR
-            ocr_results_full = reader.readtext(file_bytes)
-            
-            # Pass B: Top-right quadrant crop with contrast enhancement
-            ocr_results_crop = []
-            try:
-                img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-                w, h = img.size
-                tr_crop = img.crop((int(w * 0.70), 0, w, int(h * 0.35)))
-                tr_crop = tr_crop.resize((int(tr_crop.width * 3.5), int(tr_crop.height * 3.5)), Image.Resampling.LANCZOS)
-                tr_crop = ImageEnhance.Contrast(tr_crop.convert("L")).enhance(3.0)
-                
-                buf = io.BytesIO()
-                tr_crop.save(buf, format="PNG")
-                ocr_results_crop = reader.readtext(buf.getvalue())
-            except Exception as ce:
-                logger.warning(f"Crop OCR enhancement error: {ce}")
+            # 1. Convert bytes to OpenCV image
+            nparr = np.frombuffer(file_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-            combined_results = ocr_results_full + ocr_results_crop
-            parsed = _parse_all_ocr_results(combined_results)
-            
-            for k, v in parsed.items():
+            # 2. Extract Header Text & Overall Table Text
+            ocr_results_full = reader.readtext(file_bytes)
+            parsed_text = _parse_header_and_table(ocr_results_full)
+            for k, v in parsed_text.items():
                 if v is not None:
                     extracted_data[k] = v
+
+            # 3. Detect benchmark market price
+            bench_price = parsed_text.get("benchmark_price") or (63500.0 if "BTC" in extracted_data["symbol"] else 1.1000)
+
+            # 4. Color-Segmented Badge Extraction for exact Entry, SL, TP
+            badge_prices = _extract_color_badges(img, reader, bench_price)
+            if badge_prices.get("entry_price"):
+                extracted_data["entry_price"] = badge_prices["entry_price"]
+            if badge_prices.get("stop_loss"):
+                extracted_data["stop_loss"] = badge_prices["stop_loss"]
+            if badge_prices.get("take_profit"):
+                extracted_data["take_profit"] = badge_prices["take_profit"]
+
+            # 5. If badges not found, fallback to table numbers
+            if not extracted_data["entry_price"] or not extracted_data["stop_loss"]:
+                table_prices = _extract_table_crop_prices(img, reader, bench_price, extracted_data["action"])
+                for k, v in table_prices.items():
+                    if v is not None and not extracted_data.get(k):
+                        extracted_data[k] = v
+
+            # 6. Calculate & Verify Risk:Reward
+            if extracted_data.get("entry_price") and extracted_data.get("stop_loss") and extracted_data.get("take_profit"):
+                risk = abs(extracted_data["entry_price"] - extracted_data["stop_loss"])
+                reward = abs(extracted_data["take_profit"] - extracted_data["entry_price"])
+                if risk > 0:
+                    extracted_data["rr_ratio"] = round(reward / risk, 1)
+
+            # 7. Generate summary note
+            ep_str = f"{extracted_data['entry_price']:.2f}" if extracted_data.get('entry_price') else "N/A"
+            sl_str = f"{extracted_data['stop_loss']:.2f}" if extracted_data.get('stop_loss') else "N/A"
+            tp_str = f"{extracted_data['take_profit']:.2f}" if extracted_data.get('take_profit') else "N/A"
+            extracted_data["notes"] = f"Auto-extracted {extracted_data['action']} on {extracted_data['symbol']} (Entry: {ep_str}, SL: {sl_str}, TP: {tp_str})."
             extracted_data["confidence"] = "ocr_high"
 
             if extracted_data.get("entry_price") and extracted_data.get("stop_loss"):
                 return extracted_data
         except Exception as e:
-            logger.warning(f"EasyOCR extraction error: {e}")
+            logger.warning(f"Local OCR extraction error: {e}")
 
-    # 2. Cloud AI Vision Fallbacks if API keys present in .env
+    # Cloud AI fallbacks if API keys present in .env
     gemini_key = os.getenv("GEMINI_API_KEY", "")
     openai_key = os.getenv("OPENAI_API_KEY", "")
 
@@ -123,17 +146,113 @@ def extract_trade_info_from_image(file_bytes: bytes, filename: str) -> Dict[str,
                 extracted_data["confidence"] = "ai_high"
                 return extracted_data
         except Exception as e:
-            logger.warning(f"OpenAI vision extraction fallback: {e}")
+            logger.warning(f"OpenAI vision fallback: {e}")
 
     return extracted_data
 
 
-def _parse_all_ocr_results(combined_results: List) -> Dict[str, Any]:
+def _align_price_scale(price: float, benchmark: float) -> float:
+    """Corrects decimal placement if OCR skipped or shifted a tiny decimal point."""
+    if not price or not benchmark or benchmark <= 0:
+        return price
+    while price > benchmark * 2.5:
+        price = price / 10.0
+    while price < benchmark * 0.4:
+        price = price * 10.0
+    return round(price, 2)
+
+
+def _extract_color_badges(img: np.ndarray, reader, bench_price: float) -> Dict[str, Optional[float]]:
+    """Detects Red (SL), Blue (ENTRY), and Green (TP) badge rectangles on the chart."""
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    img_h, img_w = img.shape[:2]
+
+    # Red mask (SL)
+    mask_red1 = cv2.inRange(hsv, np.array([0, 90, 90]), np.array([12, 255, 255]))
+    mask_red2 = cv2.inRange(hsv, np.array([168, 90, 90]), np.array([180, 255, 255]))
+    mask_red = mask_red1 | mask_red2
+
+    # Blue mask (ENTRY)
+    mask_blue = cv2.inRange(hsv, np.array([95, 90, 90]), np.array([135, 255, 255]))
+
+    # Green mask (TP)
+    mask_green = cv2.inRange(hsv, np.array([35, 90, 90]), np.array([85, 255, 255]))
+
+    def read_badge_contour(mask) -> Optional[float]:
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        candidates = []
+        for c in contours:
+            x, y, w, h = cv2.boundingRect(c)
+            # Badges are rectangular boxes located on the right/middle of the chart
+            if x > img_w * 0.35 and w > 30 and 8 < h < 50:
+                x1 = max(0, x - 4)
+                y1 = max(0, y - 4)
+                x2 = min(img_w, x + w + 4)
+                y2 = min(img_h, y + h + 4)
+                crop = img[y1:y2, x1:x2]
+                if crop.shape[0] > 0 and crop.shape[1] > 0:
+                    crop = cv2.resize(crop, (crop.shape[1] * 4, crop.shape[0] * 4), interpolation=cv2.INTER_CUBIC)
+                    res = reader.readtext(crop)
+                    for _, text, conf in res:
+                        clean = text.replace(",", "").replace(" ", "").replace("O", "0").replace("o", "0")
+                        m = re.search(r"([0-9]{3,8}(?:\.[0-9]+)?)", clean)
+                        if m:
+                            raw_val = float(m.group(1))
+                            aligned = _align_price_scale(raw_val, bench_price)
+                            candidates.append((aligned, conf, x))
+        if candidates:
+            # Sort by highest x (furthest right badge label) and confidence
+            candidates.sort(key=lambda item: (item[2], item[1]), reverse=True)
+            return candidates[0][0]
+        return None
+
+    sl = read_badge_contour(mask_red)
+    entry = read_badge_contour(mask_blue)
+    tp = read_badge_contour(mask_green)
+
+    return {"entry_price": entry, "stop_loss": sl, "take_profit": tp}
+
+
+def _extract_table_crop_prices(img: np.ndarray, reader, bench_price: float, action: str) -> Dict[str, Optional[float]]:
+    """Crops the top-right quadrant where the Pine Script table sits and reads candidate prices."""
+    h, w = img.shape[:2]
+    tr_crop = img[0:int(h * 0.35), int(w * 0.65):w]
+    tr_crop = cv2.resize(tr_crop, (tr_crop.shape[1] * 3, tr_crop.shape[0] * 3), interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(tr_crop, cv2.COLOR_BGR2GRAY)
+    enhanced = cv2.equalizeHist(gray)
+    
+    res = reader.readtext(enhanced)
+    detected: List[float] = []
+    
+    for _, text, _ in res:
+        clean = text.replace(",", "").replace("O", "0")
+        for m in re.finditer(r"\b([0-9]{4,7}(?:\.[0-9]+)?)\b", clean):
+            val = float(m.group(1))
+            aligned = _align_price_scale(val, bench_price)
+            if aligned > 0 and (aligned % 50 != 0):
+                detected.append(aligned)
+
+    detected = sorted(list(set(detected)))
+    if len(detected) >= 3:
+        if action == "SELL":
+            return {"take_profit": detected[0], "entry_price": detected[1], "stop_loss": detected[2]}
+        else:
+            return {"stop_loss": detected[0], "entry_price": detected[1], "take_profit": detected[2]}
+    elif len(detected) == 2:
+        if action == "SELL":
+            return {"entry_price": detected[0], "stop_loss": detected[1], "take_profit": round(detected[0] - (detected[1] - detected[0]) * 2.0, 2)}
+        else:
+            return {"stop_loss": detected[0], "entry_price": detected[1], "take_profit": round(detected[1] + (detected[1] - detected[0]) * 2.0, 2)}
+
+    return {}
+
+
+def _parse_header_and_table(results: List) -> Dict[str, Any]:
     parsed: Dict[str, Any] = {}
-    lines = [text.strip() for _, text, _ in combined_results if text and text.strip()]
+    lines = [text.strip() for _, text, _ in results if text and text.strip()]
     full_text = " \n ".join(lines)
 
-    # 1. Extract Symbol
+    # 1. Symbol
     sym_match = re.search(r"\b(BTCUSDT|ETHUSDT|SOLUSDT|EURUSD|GBPUSD|AUDUSD|USDCAD|USDJPY|NQ1!|ES1!|NAS100|SPX500|US30)\b", full_text, re.IGNORECASE)
     if sym_match:
         parsed["symbol"] = sym_match.group(1).upper()
@@ -144,7 +263,15 @@ def _parse_all_ocr_results(combined_results: List) -> Dict[str, Any]:
     else:
         parsed["symbol"] = "BTCUSDT"
 
-    # 2. Extract Action & Outcome
+    # 2. Benchmark Market Price from OHLC Header (e.g. C63,827.3)
+    bench_match = re.search(r"[OHLC]([0-9]{2,6}(?:,[0-9]{3})*(?:\.[0-9]+)?)", full_text)
+    if bench_match:
+        try:
+            parsed["benchmark_price"] = float(bench_match.group(1).replace(",", ""))
+        except ValueError:
+            parsed["benchmark_price"] = None
+
+    # 3. Action & Outcome
     if re.search(r"SELL\s*\(\s*DONE\s*\)", full_text, re.IGNORECASE):
         parsed["action"] = "SELL"
         parsed["outcome"] = "WIN"
@@ -158,112 +285,14 @@ def _parse_all_ocr_results(combined_results: List) -> Dict[str, Any]:
     else:
         parsed["action"] = "SELL"
 
-    action = parsed.get("action", "SELL")
-
-    # 3. Extract HTF Bias
+    # 4. HTF Bias
     bias_match = re.search(r"HTF Bias[^\n]*\n\s*(BEARISH|BULLISH)", full_text, re.IGNORECASE)
     if not bias_match:
         bias_match = re.search(r"\b(BEARISH|BULLISH)\b", full_text, re.IGNORECASE)
     if bias_match:
         parsed["htf_bias"] = bias_match.group(1).upper()
 
-    # 4. Find Benchmark Asset Price from Header (O / H / L / C)
-    bench_price: Optional[float] = None
-    bench_match = re.search(r"[OHLC]([0-9]{2,6}(?:,[0-9]{3})*(?:\.[0-9]+)?)", full_text)
-    if bench_match:
-        try:
-            bench_price = float(bench_match.group(1).replace(",", ""))
-        except ValueError:
-            bench_price = None
-
-    if not bench_price:
-        if parsed["symbol"].startswith("BTC"):
-            bench_price = 63500.0
-        elif parsed["symbol"].startswith("ETH"):
-            bench_price = 2600.0
-        elif parsed["symbol"].startswith("SOL"):
-            bench_price = 150.0
-        elif "USD" in parsed["symbol"]:
-            bench_price = 1.1000
-
-    min_valid = bench_price * 0.88 if bench_price else 10.0
-    max_valid = bench_price * 1.12 if bench_price else 200000.0
-
-    # 5. Extract Candidate Price Levels
-    detected_prices: List[float] = []
-    
-    # A) Look for explicitly labeled prices
-    for i, line in enumerate(lines):
-        line_lower = line.lower()
-        if any(k in line_lower for k in ["entry", "stop", "loss", "take", "profit", "sl", "tp"]):
-            val = _extract_number_from_str(line)
-            if not val and i + 1 < len(lines):
-                val = _extract_number_from_str(lines[i + 1])
-            if val and min_valid <= val <= max_valid:
-                detected_prices.append(val)
-                if "entry" in line_lower:
-                    parsed["entry_price"] = val
-                elif "stop" in line_lower or "loss" in line_lower or line_lower.startswith("sl"):
-                    parsed["stop_loss"] = val
-                elif "take" in line_lower or "profit" in line_lower or line_lower.startswith("tp"):
-                    parsed["take_profit"] = val
-
-    # B) Extract all numbers that fit the benchmark price scale (ignoring round axis ticks)
-    for line in lines:
-        clean_line = line.replace(",", "")
-        for match in re.finditer(r"\b([1-9][0-9]{2,6}(?:\.[0-9]{1,4})?)\b", clean_line):
-            val = float(match.group(1))
-            is_axis_round = (val % 50 == 0) and val > 1000
-            if min_valid <= val <= max_valid and not is_axis_round:
-                detected_prices.append(val)
-
-    # 6. Mathematical Price Level Assignment
-    if detected_prices:
-        # Deduplicate while preserving order of proximity
-        unique_prices = sorted(list(set(detected_prices)))
-        
-        if len(unique_prices) >= 3:
-            if action == "SELL":
-                # For SELL: Take Profit (Lowest) < Entry (Middle) < Stop Loss (Highest)
-                parsed["take_profit"] = unique_prices[0]
-                parsed["entry_price"] = unique_prices[1]
-                parsed["stop_loss"] = unique_prices[2]
-            else:
-                # For BUY: Stop Loss (Lowest) < Entry (Middle) < Take Profit (Highest)
-                parsed["stop_loss"] = unique_prices[0]
-                parsed["entry_price"] = unique_prices[1]
-                parsed["take_profit"] = unique_prices[2]
-        elif len(unique_prices) == 2:
-            if action == "SELL":
-                entry = unique_prices[0]
-                sl = unique_prices[1]
-                parsed["entry_price"] = entry
-                parsed["stop_loss"] = sl
-                parsed["take_profit"] = round(entry - (sl - entry) * 2.0, 2)
-            else:
-                sl = unique_prices[0]
-                entry = unique_prices[1]
-                parsed["stop_loss"] = sl
-                parsed["entry_price"] = entry
-                parsed["take_profit"] = round(entry + (entry - sl) * 2.0, 2)
-        elif len(unique_prices) == 1:
-            entry = unique_prices[0]
-            parsed["entry_price"] = entry
-            if action == "SELL":
-                parsed["stop_loss"] = round(entry * 1.001, 2)
-                parsed["take_profit"] = round(entry * 0.998, 2)
-            else:
-                parsed["stop_loss"] = round(entry * 0.999, 2)
-                parsed["take_profit"] = round(entry * 1.002, 2)
-
-    # Auto-calculate Risk:Reward
-    if parsed.get("entry_price") and parsed.get("stop_loss") and parsed.get("take_profit"):
-        risk = abs(parsed["entry_price"] - parsed["stop_loss"])
-        reward = abs(parsed["take_profit"] - parsed["entry_price"])
-        if risk > 0:
-            parsed["rr_ratio"] = round(reward / risk, 1)
-
-    # 7. Extract Session Date & NY Time
+    # 5. Session Date
     date_match = re.search(r"(Mon|Tue|Wed|Thu|Fri|Sat|Sun)?\s*([0-9]{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)(?:\s*'?([0-9]{2,4}))?", full_text, re.IGNORECASE)
     if date_match:
         try:
@@ -278,29 +307,12 @@ def _parse_all_ocr_results(combined_results: List) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # Extract NY session time (e.g. 09:45, 10:20, 15:33)
+    # 6. Session Time
     time_match = re.search(r"\b(09:[3-5][0-9]|10:[0-5][0-9]|11:[0-3][0-9]|14:[0-5][0-9]|15:[0-5][0-9]|16:[0-5][0-9])\b", full_text)
     if time_match:
         parsed["ny_time"] = time_match.group(1)
 
-    # 8. Summary Note
-    ep_str = f"{parsed['entry_price']:.2f}" if parsed.get('entry_price') else "N/A"
-    sl_str = f"{parsed['stop_loss']:.2f}" if parsed.get('stop_loss') else "N/A"
-    tp_str = f"{parsed['take_profit']:.2f}" if parsed.get('take_profit') else "N/A"
-    parsed["notes"] = f"Auto-extracted {parsed.get('action', 'TRADE')} on {parsed.get('symbol', 'BTCUSDT')} (Entry: {ep_str}, SL: {sl_str}, TP: {tp_str})."
-
     return parsed
-
-
-def _extract_number_from_str(s: str) -> Optional[float]:
-    clean = s.replace(",", "")
-    match = re.search(r"([0-9]{2,6}(?:\.[0-9]+)?)", clean)
-    if match:
-        try:
-            return float(match.group(1))
-        except ValueError:
-            return None
-    return None
 
 
 def _extract_with_gemini(file_bytes: bytes, api_key: str) -> Optional[Dict[str, Any]]:
@@ -328,7 +340,7 @@ def _extract_with_gemini(file_bytes: bytes, api_key: str) -> Optional[Dict[str, 
       "ny_time": "Time string (e.g. 09:55 AM)",
       "notes": "Short concise 1-sentence analysis of the trade execution shown on chart"
     }
-    Look at the top-right status table and chart badges (ENTRY, SL, TP, Risk:Reward, HTF Bias).
+    Look at the badges on the right (ENTRY, SL, TP) and the top-right status table.
     Return ONLY pure JSON. No markdown code blocks.
     """
 
