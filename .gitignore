@@ -3,6 +3,7 @@ agent/.venv/
 __pycache__/
 .pytest_cache/
 *.pyc
+*.log
 
 # Coverage reports
 .coverage

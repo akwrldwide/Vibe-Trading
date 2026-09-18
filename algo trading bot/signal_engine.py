@@ -21,7 +21,6 @@ class NYOpenICTSignalEngine:
         self.require_sl_for_second_trade = bool(self.config.get("require_sl_for_second_trade", True))
         self.max_clean_tp_bars = int(self.config.get("max_clean_tp_bars", 10))
         self.max_clean_tp_drawdown_pct = float(self.config.get("max_clean_tp_drawdown_pct", 0.30))
-        self.allow_weekend_trading = bool(self.config.get("allow_weekend_trading", False))
 
     def generate_signals(self, df_1m: pd.DataFrame) -> pd.DataFrame:
         if df_1m.empty or len(df_1m) < 30:
@@ -92,11 +91,8 @@ class NYOpenICTSignalEngine:
         df["fvg_bearish"] = df["high"] < df["low"].shift(2)
         df["fvg_bearish_ce"] = (df["low"].shift(2) + df["high"]) / 2.0
 
-        # Trade window: 9:45 AM - 11:30 AM EST (Excluding Saturdays & Sundays by default)
-        is_weekday = df.index.dayofweek < 5
+        # Trade window: 9:45 AM - 11:30 AM EST
         valid_time = (df["time"] >= pd.to_datetime("09:45").time()) & (df["time"] <= pd.to_datetime("11:30").time())
-        if not self.allow_weekend_trading:
-            valid_time = valid_time & is_weekday
 
         signals = np.zeros(len(df))
         entry_prices = np.full(len(df), np.nan)

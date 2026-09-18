@@ -1,8 +1,8 @@
 //@version=6
-indicator("9:30 NY Open 1m ICT FVG (Alpaca Bugfixed)", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500, max_bars_back=1000)
+indicator("9:30 NY Open 1m ICT FVG (Deriv & Webhook Multi-TP Upgrade)", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500, max_bars_back=1000)
 
 // ============================================================================
-// INPUT PARAMETERS
+// 1. INPUT PARAMETERS
 // ============================================================================
 passcode                 = input.string("MY_SECRET_PASSCODE", "Webhook Passcode", group="Webhook Settings")
 use_htf_filter           = input.bool(true, "Use HTF Trend Filter (15m 50 EMA)", group="Strategy Parameters")
@@ -15,13 +15,23 @@ mid_inval_mode           = input.string("Allow Re-breakout", "Range Midpoint Inv
 cancel_on_opposite_break = input.bool(true, "Cancel Pending Order on Opposite OR Break", group="Strategy Parameters")
 sl_mode                  = input.string("4-Bar Swing Low/High", "Stop Loss Mode", options=["3-Bar FVG Swing Low/High", "4-Bar Swing Low/High", "FVG Gap Edge", "Fixed Pips"], group="Strategy Parameters")
 fixed_sl_pips            = input.float(3.0, "Fixed SL Pips (if Fixed Pips selected)", minval=1.0, step=0.5, group="Strategy Parameters")
-rr_ratio                 = input.float(2.0, "Risk:Reward Ratio", minval=0.5, step=0.5, group="Strategy Parameters")
 htf_ema_period           = input.int(50, "HTF EMA Period", minval=10, group="Strategy Parameters")
 sl_buffer_val            = input.float(2.0, "SL Buffer (Pips/Points)", minval=0.0, step=0.5, group="Strategy Parameters")
 min_fvg_val              = input.float(0.1, "Min FVG Size (Pips/Points)", minval=0.0, step=0.1, group="Strategy Parameters")
 max_daily_trades         = input.int(2, "Max Trades Per Day", minval=1, maxval=10, group="Strategy Parameters")
 require_sl_for_second_trade = input.bool(true, "Require SL on Trade 1 for Trade 2 (Loss Recovery)", group="Strategy Parameters")
 allow_weekend_trading    = input.bool(false, "Allow Trading on Saturdays & Sundays", group="Strategy Parameters")
+
+// ----------------------------------------------------------------------------
+// MULTI-TP & RISK MANAGEMENT SETTINGS (DERIV AUTO-BRIDGE)
+// ----------------------------------------------------------------------------
+group_risk_mgnt          = "Multi-TP & Risk Management (Deriv Auto-Bridge)"
+enable_partial_tp        = input.bool(true, "Enable Partial Take Profit (TP1)", group=group_risk_mgnt)
+tp1_rr_ratio             = input.float(1.5, "TP1 Target (RR Ratio)", minval=0.5, step=0.1, group=group_risk_mgnt, tooltip="Target to trigger partial exit (50%) and move SL to breakeven")
+tp1_close_pct            = input.float(50.0, "TP1 Partial Close %", minval=10.0, maxval=90.0, step=5.0, group=group_risk_mgnt, tooltip="Percentage of position to close at TP1")
+tp2_rr_ratio             = input.float(3.0, "TP2 Target / Runner (RR Ratio)", minval=1.0, step=0.5, group=group_risk_mgnt, tooltip="Final target for remaining position runner")
+enable_remove_risk       = input.bool(true, "Auto Move SL to Breakeven/Profit", group=group_risk_mgnt)
+be_offset_pips           = input.float(0.5, "Breakeven Lock-in Offset (Pips/Points)", minval=0.0, step=0.1, group=group_risk_mgnt, tooltip="Pips into profit above entry to lock in spread/commission")
 
 // Visual Settings
 extend_drawings          = input.bool(true, "Extend Lines/Boxes Until Trade Closes", group="Visuals")
@@ -33,7 +43,7 @@ show_table               = input.bool(true, "Show Status Table", group="Visuals"
 table_pos                = input.string("Top Right", "Table Position", options=["Top Right", "Bottom Right", "Top Left", "Bottom Left"], group="Visuals")
 
 // ============================================================================
-// TIMEZONE & SESSION DEFINITIONS (NY EST/EDT)
+// 2. TIMEZONE & SESSION DEFINITIONS (NY EST/EDT)
 // ============================================================================
 ny_hour   = hour(time, "America/New_York")
 ny_minute = minute(time, "America/New_York")
@@ -52,7 +62,7 @@ ny_day_change  = ta.change(ny_day_ts)
 is_new_day     = not na(ny_day_change) and ny_day_change != 0
 
 // ============================================================================
-// 15-MINUTE OPENING RANGE CALCULATION (09:30 - 09:45 AM)
+// 3. 15-MINUTE OPENING RANGE CALCULATION (09:30 - 09:45 AM)
 // ============================================================================
 var float or_high = na
 var float or_low  = na
@@ -68,17 +78,26 @@ var bool trade_completed = false
 var int current_signal = 0 // 1 = Buy, -1 = Sell, 0 = None
 
 var float signal_entry     = na
-var float signal_sl        = na
-var float signal_tp        = na
+var float signal_initial_sl= na
+var float signal_current_sl= na
+var float signal_tp1       = na
+var float signal_tp2       = na
+var float signal_be        = na
+
+var bool tp1_hit_flag      = false
+var bool tp2_hit_flag      = false
+var bool risk_removed_flag = false
 
 // Persistent Drawing Object References
 var box   active_fvg_box   = na
 var line  active_entry_ln  = na
 var line  active_sl_ln     = na
-var line  active_tp_ln     = na
+var line  active_tp1_ln    = na
+var line  active_tp2_ln    = na
 var label active_entry_lbl = na
 var label active_sl_lbl    = na
-var label active_tp_lbl    = na
+var label active_tp1_lbl   = na
+var label active_tp2_lbl   = na
 
 if is_new_day
     or_high := na
@@ -93,16 +112,24 @@ if is_new_day
     pending_order_active := false
     trade_completed := false
     current_signal := 0
-    signal_entry := na
-    signal_sl    := na
-    signal_tp    := na
+    signal_entry      := na
+    signal_initial_sl := na
+    signal_current_sl := na
+    signal_tp1        := na
+    signal_tp2        := na
+    signal_be         := na
+    tp1_hit_flag      := false
+    tp2_hit_flag      := false
+    risk_removed_flag := false
     active_fvg_box   := na
     active_entry_ln  := na
     active_sl_ln     := na
-    active_tp_ln     := na
+    active_tp1_ln    := na
+    active_tp2_ln    := na
     active_entry_lbl := na
     active_sl_lbl    := na
-    active_tp_lbl    := na
+    active_tp1_lbl   := na
+    active_tp2_lbl   := na
 
 if is_or_window
     if na(or_high) or high > or_high
@@ -113,9 +140,8 @@ if is_or_window
 or_mid = not na(or_high) and not na(or_low) ? (or_high + or_low) / 2.0 : na
 
 // ============================================================================
-// HTF EMA TREND BIAS & PLOT (NON-REPAINTING SYNCHRONIZATION)
+// 4. HTF EMA TREND BIAS & PLOT
 // ============================================================================
-// Calculate HTF close and HTF EMA (Fast sync on current price or completed bar [1])
 htf_close_closed = request.security(syminfo.tickerid, htf_tf, close[1], barmerge.gaps_off, barmerge.lookahead_off)
 htf_ema_closed   = request.security(syminfo.tickerid, htf_tf, ta.ema(close, htf_ema_period)[1], barmerge.gaps_off, barmerge.lookahead_off)
 htf_ema_live     = request.security(syminfo.tickerid, htf_tf, ta.ema(close, htf_ema_period), barmerge.gaps_off, barmerge.lookahead_off)
@@ -123,24 +149,24 @@ htf_ema_live     = request.security(syminfo.tickerid, htf_tf, ta.ema(close, htf_
 is_htf_bullish = htf_eval_mode == "Fast (Current Price > HTF EMA)" ? (close > htf_ema_live) : (htf_close_closed > htf_ema_closed)
 is_htf_bearish = htf_eval_mode == "Fast (Current Price > HTF EMA)" ? (close < htf_ema_live) : (htf_close_closed < htf_ema_closed)
 
-// Visible HTF EMA Plot line
 plot(show_htf_ema ? (htf_eval_mode == "Fast (Current Price > HTF EMA)" ? htf_ema_live : htf_ema_closed) : na, "HTF EMA Line", color=color.orange, linewidth=2)
 
 // ============================================================================
-// 1m FAIR VALUE GAP (FVG) DETECTION
+// 5. 1m FAIR VALUE GAP (FVG) DETECTION
 // ============================================================================
 unit_size = syminfo.type == "forex" ? syminfo.mintick * 10.0 : 1.0
 buffer_val = sl_buffer_val * unit_size
 min_fvg_threshold = min_fvg_val * unit_size
+be_offset_val = be_offset_pips * unit_size
 
-// Bullish FVG (Gap between candle 1 [2] high and candle 3 [0] low)
+// Bullish FVG
 fvg_bullish_gap = low - high[2]
 is_fvg_bullish = (low > high[2]) and (fvg_bullish_gap >= min_fvg_threshold)
 fvg_bullish_top = low
 fvg_bullish_bottom = high[2]
 fvg_bullish_ce = (high[2] + low) / 2.0
 
-// Bearish FVG (Gap between candle 1 [2] low and candle 3 [0] high)
+// Bearish FVG
 fvg_bearish_gap = low[2] - high
 is_fvg_bearish = (high < low[2]) and (fvg_bearish_gap >= min_fvg_threshold)
 fvg_bearish_top = low[2]
@@ -148,12 +174,11 @@ fvg_bearish_bottom = high
 fvg_bearish_ce = (low[2] + high) / 2.0
 
 // ============================================================================
-// 15m RANGE BREAKOUT STATE MACHINE (RULE 1, 2, 3)
+// 6. RANGE BREAKOUT STATE MACHINE
 // ============================================================================
 is_above_or = not na(or_high) and close > or_high
 is_below_or = not na(or_low) and close < or_low
 
-// State: 0 = Waiting for Breakout, 1 = Broken Above, -1 = Broken Below
 var int breakout_state = 0
 var int breakout_bar_index = na
 
@@ -161,7 +186,6 @@ if is_new_day
     breakout_state := 0
     breakout_bar_index := na
 
-// RULE 1: If breakout occurs but price retraces back into 50% midpoint, reset state to WAITING
 if is_trade_window and not na(or_mid)
     if breakout_state == 1 and close < or_mid
         breakout_state := 0
@@ -170,7 +194,6 @@ if is_trade_window and not na(or_mid)
         breakout_state := 0
         breakout_bar_index := na
 
-// Track fresh breakout above OR High / below OR Low
 if is_trade_window
     if is_above_or
         if breakout_state != 1
@@ -181,65 +204,123 @@ if is_trade_window
             breakout_state := -1
             breakout_bar_index := bar_index
 
-// ----------------------------------------------------------------------------
-// FVG BREAKOUT QUALIFICATION (RULES 2 & 3)
-// ----------------------------------------------------------------------------
-// RULE 2: Breakout candle can be Candle 1 (bar[2]) or Candle 2 (bar[1]) of FVG,
-//         or FVG formed AFTER breakout. Breakout as Candle 3 ONLY is DISQUALIFIED.
-// RULE 3: Candle 3 (bar[0]) MUST close outside the range (cannot close back inside).
-
-// Bullish Qualification:
+// Qualification Rules
 bullish_c1_is_breakout = not na(or_high) and (close[2] > or_high and close[3] <= or_high) or (not na(breakout_bar_index) and breakout_bar_index == bar_index - 2)
 bullish_c2_is_breakout = not na(or_high) and (close[1] > or_high and close[2] <= or_high) or (not na(breakout_bar_index) and breakout_bar_index == bar_index - 1)
 bullish_is_after_breakout = (breakout_state == 1) and not na(breakout_bar_index) and (breakout_bar_index <= bar_index - 2) and (close[2] > or_high and close[1] > or_high)
 
 valid_bullish_breakout_pos = bullish_c1_is_breakout or bullish_c2_is_breakout or bullish_is_after_breakout
-bullish_c3_confirms = not na(or_high) and (close > or_high) // Rule 3: Candle 3 MUST close above OR High
+bullish_c3_confirms = not na(or_high) and (close > or_high)
 
 is_valid_bullish_setup = is_fvg_bullish and valid_bullish_breakout_pos and bullish_c3_confirms
 
-// Bearish Qualification:
 bearish_c1_is_breakout = not na(or_low) and (close[2] < or_low and close[3] >= or_low) or (not na(breakout_bar_index) and breakout_bar_index == bar_index - 2)
 bearish_c2_is_breakout = not na(or_low) and (close[1] < or_low and close[2] >= or_low) or (not na(breakout_bar_index) and breakout_bar_index == bar_index - 1)
 bearish_is_after_breakout = (breakout_state == -1) and not na(breakout_bar_index) and (breakout_bar_index <= bar_index - 2) and (close[2] < or_low and close[1] < or_low)
 
 valid_bearish_breakout_pos = bearish_c1_is_breakout or bearish_c2_is_breakout or bearish_is_after_breakout
-bearish_c3_confirms = not na(or_low) and (close < or_low) // Rule 3: Candle 3 MUST close below OR Low
+bearish_c3_confirms = not na(or_low) and (close < or_low)
 
 is_valid_bearish_setup = is_fvg_bearish and valid_bearish_breakout_pos and bearish_c3_confirms
 
 long_htf_ok  = not use_htf_filter or is_htf_bullish
 short_htf_ok = not use_htf_filter or is_htf_bearish
 
-buy_signal    = false
-sell_signal   = false
-cancel_signal = false
-tp_hit_signal = false
+// Signal & Management Trigger Flags
+buy_signal         = false
+sell_signal        = false
+cancel_signal      = false
+partial_tp_signal  = false
+full_tp_signal     = false
+sl_hit_signal      = false
 
-// Track trade progression (TP/SL Hit) to deactivate pending status
+// ============================================================================
+// 7. ACTIVE TRADE MANAGEMENT ENGINE (DYNAMIC SL & MULTI-TP)
+// ============================================================================
 if pending_order_active and not trade_completed
-    if current_signal == 1
-        if high >= signal_tp
-            trade_completed := true
-            pending_order_active := false
-            tp_hit_signal := true
-            allow_second_trade := not require_sl_for_second_trade
-        else if low <= signal_sl
-            trade_completed := true
-            pending_order_active := false
-            allow_second_trade := true
-    else if current_signal == -1
-        if low <= signal_tp
-            trade_completed := true
-            pending_order_active := false
-            tp_hit_signal := true
-            allow_second_trade := not require_sl_for_second_trade
-        else if high >= signal_sl
-            trade_completed := true
-            pending_order_active := false
-            allow_second_trade := true
+    if current_signal == 1 // LONG TRADE
+        // 1. Check Partial TP1 / Remove Risk
+        if enable_partial_tp and not tp1_hit_flag and high >= signal_tp1
+            tp1_hit_flag := true
+            partial_tp_signal := true
+            if enable_remove_risk
+                risk_removed_flag := true
+                signal_current_sl := signal_be
+                
+                // Update chart SL visual line to Breakeven level
+                if show_trade_levels and not na(active_sl_ln)
+                    line.set_y1(active_sl_ln, signal_be)
+                    line.set_y2(active_sl_ln, signal_be)
+                    line.set_color(active_sl_ln, color.teal)
+                    label.set_y(active_sl_lbl, signal_be)
+                    label.set_text(active_sl_lbl, "SL (BE): " + str.tostring(signal_be, "#.#####"))
+                    label.set_color(active_sl_lbl, color.new(color.teal, 20))
 
-    // Dynamically extend active drawing levels to the right while trade is in play
+            // Webhook JSON for Partial Exit & Move SL to BE
+            ptp_json = '{"passcode": "' + passcode + '", "symbol": "' + syminfo.ticker + '", "action": "PARTIAL_TP", "close_pct": ' + str.tostring(tp1_close_pct, "#.#") + ', "new_sl": ' + str.tostring(signal_be, "#.#####") + ', "reason": "TP1 Hit (1:' + str.tostring(tp1_rr_ratio, "#.#") + ')"}'
+            alert(ptp_json, alert.freq_once_per_bar_close)
+
+        // 2. Check Final TP2 (Runner Exit)
+        if high >= signal_tp2
+            tp2_hit_flag := true
+            full_tp_signal := true
+            trade_completed := true
+            pending_order_active := false
+            allow_second_trade := not require_sl_for_second_trade
+            ftp_json = '{"passcode": "' + passcode + '", "symbol": "' + syminfo.ticker + '", "action": "FULL_TP", "reason": "TP2 Runner Target Hit (1:' + str.tostring(tp2_rr_ratio, "#.#") + ')"}'
+            alert(ftp_json, alert.freq_once_per_bar_close)
+
+        // 3. Check Stop Loss Hit
+        else if low <= signal_current_sl
+            sl_hit_signal := true
+            trade_completed := true
+            pending_order_active := false
+            allow_second_trade := true
+            sl_json = '{"passcode": "' + passcode + '", "symbol": "' + syminfo.ticker + '", "action": "SL_HIT", "reason": "Stop Loss Breached"}'
+            alert(sl_json, alert.freq_once_per_bar_close)
+
+    else if current_signal == -1 // SHORT TRADE
+        // 1. Check Partial TP1 / Remove Risk
+        if enable_partial_tp and not tp1_hit_flag and low <= signal_tp1
+            tp1_hit_flag := true
+            partial_tp_signal := true
+            if enable_remove_risk
+                risk_removed_flag := true
+                signal_current_sl := signal_be
+                
+                // Update chart SL visual line to Breakeven level
+                if show_trade_levels and not na(active_sl_ln)
+                    line.set_y1(active_sl_ln, signal_be)
+                    line.set_y2(active_sl_ln, signal_be)
+                    line.set_color(active_sl_ln, color.teal)
+                    label.set_y(active_sl_lbl, signal_be)
+                    label.set_text(active_sl_lbl, "SL (BE): " + str.tostring(signal_be, "#.#####"))
+                    label.set_color(active_sl_lbl, color.new(color.teal, 20))
+
+            // Webhook JSON for Partial Exit & Move SL to BE
+            ptp_json = '{"passcode": "' + passcode + '", "symbol": "' + syminfo.ticker + '", "action": "PARTIAL_TP", "close_pct": ' + str.tostring(tp1_close_pct, "#.#") + ', "new_sl": ' + str.tostring(signal_be, "#.#####") + ', "reason": "TP1 Hit (1:' + str.tostring(tp1_rr_ratio, "#.#") + ')"}'
+            alert(ptp_json, alert.freq_once_per_bar_close)
+
+        // 2. Check Final TP2 (Runner Exit)
+        if low <= signal_tp2
+            tp2_hit_flag := true
+            full_tp_signal := true
+            trade_completed := true
+            pending_order_active := false
+            allow_second_trade := not require_sl_for_second_trade
+            ftp_json = '{"passcode": "' + passcode + '", "symbol": "' + syminfo.ticker + '", "action": "FULL_TP", "reason": "TP2 Runner Target Hit (1:' + str.tostring(tp2_rr_ratio, "#.#") + ')"}'
+            alert(ftp_json, alert.freq_once_per_bar_close)
+
+        // 3. Check Stop Loss Hit
+        else if high >= signal_current_sl
+            sl_hit_signal := true
+            trade_completed := true
+            pending_order_active := false
+            allow_second_trade := true
+            sl_json = '{"passcode": "' + passcode + '", "symbol": "' + syminfo.ticker + '", "action": "SL_HIT", "reason": "Stop Loss Breached"}'
+            alert(sl_json, alert.freq_once_per_bar_close)
+
+    // Dynamically extend active drawing levels to the right while trade is active
     if extend_drawings and not na(active_fvg_box)
         box.set_right(active_fvg_box, bar_index)
         if not na(active_entry_ln)
@@ -248,11 +329,14 @@ if pending_order_active and not trade_completed
         if not na(active_sl_ln)
             line.set_x2(active_sl_ln, bar_index)
             label.set_x(active_sl_lbl, bar_index)
-        if not na(active_tp_ln)
-            line.set_x2(active_tp_ln, bar_index)
-            label.set_x(active_tp_lbl, bar_index)
+        if not na(active_tp1_ln)
+            line.set_x2(active_tp1_ln, bar_index)
+            label.set_x(active_tp1_lbl, bar_index)
+        if not na(active_tp2_ln)
+            line.set_x2(active_tp2_ln, bar_index)
+            label.set_x(active_tp2_lbl, bar_index)
 
-// Check opposite OR breach cancellation ONLY if trade was NOT completed (TP/SL not hit)
+// Check opposite OR breach cancellation ONLY if trade was NOT completed
 if pending_order_active and not trade_completed and cancel_on_opposite_break
     if current_signal == 1 and is_below_or
         cancel_signal := true
@@ -267,6 +351,9 @@ if pending_order_active and not trade_completed and cancel_on_opposite_break
         cancel_json = '{"passcode": "' + passcode + '", "symbol": "' + syminfo.ticker + '", "action": "CANCEL", "reason": "Opposite OR High breached"}'
         alert(cancel_json, alert.freq_once_per_bar_close)
 
+// ============================================================================
+// 8. NEW SIGNAL GENERATION & DRAWINGS
+// ============================================================================
 can_take_trade = (daily_trades_count < max_daily_trades) and ((daily_trades_count == 0) or (daily_trades_count == 1 and allow_second_trade and not pending_order_active))
 
 if is_valid_time and can_take_trade
@@ -274,7 +361,6 @@ if is_valid_time and can_take_trade
     if is_valid_bullish_setup and long_htf_ok
         entry = entry_type == "FVG Gap Edge (Fast Entry)" ? fvg_bullish_top : entry_type == "Breakout Candle Close" ? close : fvg_bullish_ce
         
-        // SL calculation based on sl_mode
         float sl = na
         if sl_mode == "3-Bar FVG Swing Low/High"
             struct_low = math.min(low, low[1], low[2])
@@ -289,16 +375,25 @@ if is_valid_time and can_take_trade
 
         risk = entry - sl
         if risk > 0
-            tp = entry + (risk * rr_ratio)
-            buy_signal := true
-            current_signal := 1
-            signal_entry := entry
-            signal_sl    := sl
-            signal_tp    := tp
+            tp1 = entry + (risk * tp1_rr_ratio)
+            tp2 = entry + (risk * tp2_rr_ratio)
+            be  = entry + be_offset_val
+
+            buy_signal          := true
+            current_signal      := 1
+            signal_entry        := entry
+            signal_initial_sl   := sl
+            signal_current_sl   := sl
+            signal_tp1          := tp1
+            signal_tp2          := tp2
+            signal_be           := be
             session_trade_taken := true
-            daily_trades_count := daily_trades_count + 1
-            pending_order_active := true
-            trade_completed := false
+            daily_trades_count  := daily_trades_count + 1
+            pending_order_active:= true
+            trade_completed     := false
+            tp1_hit_flag        := false
+            tp2_hit_flag        := false
+            risk_removed_flag   := false
             
             target_right = bar_index + box_width_bars
 
@@ -306,35 +401,32 @@ if is_valid_time and can_take_trade
             active_fvg_box := box.new(left=bar_index-2, top=fvg_bullish_top, right=target_right, bottom=fvg_bullish_bottom, 
                                       border_color=color.purple, border_width=2, bgcolor=color.new(color.purple, 75))
 
-            // Draw Entry, SL, and TP Lines & Labels Directly Anchored to Signal FVG Box
+            // Draw Entry, SL, TP1, and TP2 Lines & Labels
             if show_trade_levels
                 // Entry Line & Badge
-                active_entry_ln  := line.new(x1=bar_index-2, y1=entry, x2=target_right, y2=entry, 
-                                             color=color.blue, width=2, style=line.style_solid)
-                active_entry_lbl := label.new(x=target_right, y=entry, text="ENTRY: " + str.tostring(entry, "#.#####"), 
-                                              color=color.new(color.blue, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
+                active_entry_ln  := line.new(x1=bar_index-2, y1=entry, x2=target_right, y2=entry, color=color.blue, width=2, style=line.style_solid)
+                active_entry_lbl := label.new(x=target_right, y=entry, text="ENTRY: " + str.tostring(entry, "#.#####"), color=color.new(color.blue, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
 
                 // Stop Loss Line & Badge
-                active_sl_ln     := line.new(x1=bar_index-2, y1=sl, x2=target_right, y2=sl, 
-                                             color=color.red, width=2, style=line.style_dashed)
-                active_sl_lbl    := label.new(x=target_right, y=sl, text="SL: " + str.tostring(sl, "#.#####"), 
-                                              color=color.new(color.red, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
+                active_sl_ln     := line.new(x1=bar_index-2, y1=sl, x2=target_right, y2=sl, color=color.red, width=2, style=line.style_dashed)
+                active_sl_lbl    := label.new(x=target_right, y=sl, text="SL: " + str.tostring(sl, "#.#####"), color=color.new(color.red, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
 
-                // Take Profit Line & Badge
-                active_tp_ln     := line.new(x1=bar_index-2, y1=tp, x2=target_right, y2=tp, 
-                                             color=color.green, width=2, style=line.style_dashed)
-                active_tp_lbl    := label.new(x=target_right, y=tp, text="TP: " + str.tostring(tp, "#.#####"), 
-                                              color=color.new(color.green, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
+                // TP1 Partial Line & Badge
+                active_tp1_ln    := line.new(x1=bar_index-2, y1=tp1, x2=target_right, y2=tp1, color=color.blue, width=2, style=line.style_dashed)
+                active_tp1_lbl   := label.new(x=target_right, y=tp1, text="TP1 (50%): " + str.tostring(tp1, "#.#####"), color=color.new(color.blue, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
+
+                // TP2 Runner Line & Badge
+                active_tp2_ln    := line.new(x1=bar_index-2, y1=tp2, x2=target_right, y2=tp2, color=color.green, width=2, style=line.style_dashed)
+                active_tp2_lbl   := label.new(x=target_right, y=tp2, text="TP2 (Runner): " + str.tostring(tp2, "#.#####"), color=color.new(color.green, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
 
             // Dynamic Webhook Alert
-            buy_json = '{"passcode": "' + passcode + '", "symbol": "' + syminfo.ticker + '", "action": "BUY", "limit_price": ' + str.tostring(entry, "#.#####") + ', "stop_loss": ' + str.tostring(sl, "#.#####") + ', "take_profit": ' + str.tostring(tp, "#.#####") + '}'
+            buy_json = '{"passcode": "' + passcode + '", "symbol": "' + syminfo.ticker + '", "action": "BUY", "limit_price": ' + str.tostring(entry, "#.#####") + ', "stop_loss": ' + str.tostring(sl, "#.#####") + ', "tp1": ' + str.tostring(tp1, "#.#####") + ', "tp2": ' + str.tostring(tp2, "#.#####") + ', "tp1_close_pct": ' + str.tostring(tp1_close_pct, "#.#") + '}'
             alert(buy_json, alert.freq_once_per_bar_close)
 
     // Bearish Short Signal
     else if is_valid_bearish_setup and short_htf_ok
         entry = entry_type == "FVG Gap Edge (Fast Entry)" ? fvg_bearish_bottom : entry_type == "Breakout Candle Close" ? close : fvg_bearish_ce
         
-        // SL calculation based on sl_mode
         float sl = na
         if sl_mode == "3-Bar FVG Swing Low/High"
             struct_high = math.max(high, high[1], high[2])
@@ -349,16 +441,25 @@ if is_valid_time and can_take_trade
 
         risk = sl - entry
         if risk > 0
-            tp = entry - (risk * rr_ratio)
-            sell_signal := true
-            current_signal := -1
-            signal_entry := entry
-            signal_sl    := sl
-            signal_tp    := tp
+            tp1 = entry - (risk * tp1_rr_ratio)
+            tp2 = entry - (risk * tp2_rr_ratio)
+            be  = entry - be_offset_val
+
+            sell_signal         := true
+            current_signal      := -1
+            signal_entry        := entry
+            signal_initial_sl   := sl
+            signal_current_sl   := sl
+            signal_tp1          := tp1
+            signal_tp2          := tp2
+            signal_be           := be
             session_trade_taken := true
-            daily_trades_count := daily_trades_count + 1
-            pending_order_active := true
-            trade_completed := false
+            daily_trades_count  := daily_trades_count + 1
+            pending_order_active:= true
+            trade_completed     := false
+            tp1_hit_flag        := false
+            tp2_hit_flag        := false
+            risk_removed_flag   := false
             
             target_right = bar_index + box_width_bars
 
@@ -366,32 +467,30 @@ if is_valid_time and can_take_trade
             active_fvg_box := box.new(left=bar_index-2, top=fvg_bearish_top, right=target_right, bottom=fvg_bearish_bottom, 
                                       border_color=color.purple, border_width=2, bgcolor=color.new(color.purple, 75))
 
-            // Draw Entry, SL, and TP Lines & Labels Directly Anchored to Signal FVG Box
+            // Draw Entry, SL, TP1, and TP2 Lines & Labels
             if show_trade_levels
                 // Entry Line & Badge
-                active_entry_ln  := line.new(x1=bar_index-2, y1=entry, x2=target_right, y2=entry, 
-                                             color=color.blue, width=2, style=line.style_solid)
-                active_entry_lbl := label.new(x=target_right, y=entry, text="ENTRY: " + str.tostring(entry, "#.#####"), 
-                                              color=color.new(color.blue, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
+                active_entry_ln  := line.new(x1=bar_index-2, y1=entry, x2=target_right, y2=entry, color=color.blue, width=2, style=line.style_solid)
+                active_entry_lbl := label.new(x=target_right, y=entry, text="ENTRY: " + str.tostring(entry, "#.#####"), color=color.new(color.blue, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
 
                 // Stop Loss Line & Badge
-                active_sl_ln     := line.new(x1=bar_index-2, y1=sl, x2=target_right, y2=sl, 
-                                             color=color.red, width=2, style=line.style_dashed)
-                active_sl_lbl    := label.new(x=target_right, y=sl, text="SL: " + str.tostring(sl, "#.#####"), 
-                                              color=color.new(color.red, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
+                active_sl_ln     := line.new(x1=bar_index-2, y1=sl, x2=target_right, y2=sl, color=color.red, width=2, style=line.style_dashed)
+                active_sl_lbl    := label.new(x=target_right, y=sl, text="SL: " + str.tostring(sl, "#.#####"), color=color.new(color.red, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
 
-                // Take Profit Line & Badge
-                active_tp_ln     := line.new(x1=bar_index-2, y1=tp, x2=target_right, y2=tp, 
-                                             color=color.green, width=2, style=line.style_dashed)
-                active_tp_lbl    := label.new(x=target_right, y=tp, text="TP: " + str.tostring(tp, "#.#####"), 
-                                              color=color.new(color.green, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
+                // TP1 Partial Line & Badge
+                active_tp1_ln    := line.new(x1=bar_index-2, y1=tp1, x2=target_right, y2=tp1, color=color.blue, width=2, style=line.style_dashed)
+                active_tp1_lbl   := label.new(x=target_right, y=tp1, text="TP1 (50%): " + str.tostring(tp1, "#.#####"), color=color.new(color.blue, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
+
+                // TP2 Runner Line & Badge
+                active_tp2_ln    := line.new(x1=bar_index-2, y1=tp2, x2=target_right, y2=tp2, color=color.green, width=2, style=line.style_dashed)
+                active_tp2_lbl   := label.new(x=target_right, y=tp2, text="TP2 (Runner): " + str.tostring(tp2, "#.#####"), color=color.new(color.green, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
 
             // Dynamic Webhook Alert
-            sell_json = '{"passcode": "' + passcode + '", "symbol": "' + syminfo.ticker + '", "action": "SELL", "limit_price": ' + str.tostring(entry, "#.#####") + ', "stop_loss": ' + str.tostring(sl, "#.#####") + ', "take_profit": ' + str.tostring(tp, "#.#####") + '}'
+            sell_json = '{"passcode": "' + passcode + '", "symbol": "' + syminfo.ticker + '", "action": "SELL", "limit_price": ' + str.tostring(entry, "#.#####") + ', "stop_loss": ' + str.tostring(sl, "#.#####") + ', "tp1": ' + str.tostring(tp1, "#.#####") + ', "tp2": ' + str.tostring(tp2, "#.#####") + ', "tp1_close_pct": ' + str.tostring(tp1_close_pct, "#.#") + '}'
             alert(sell_json, alert.freq_once_per_bar_close)
 
 // ============================================================================
-// VISUAL PLOTS ON CHART
+// 9. VISUAL PLOTS ON CHART
 // ============================================================================
 plot_or_high = is_full_session ? or_high : na
 plot_or_low  = is_full_session ? or_low  : na
@@ -406,7 +505,7 @@ plotshape(sell_signal, title="SELL Signal Triangle", style=shape.triangledown, l
 plotshape(cancel_signal, title="CANCEL Signal", style=shape.xcross, location=location.abovebar, color=color.orange, size=size.small)
 
 // ============================================================================
-// STATUS TABLE OVERLAY
+// 10. STATUS TABLE OVERLAY (HUD)
 // ============================================================================
 tbl_pos = switch table_pos
     "Top Right"    => position.top_right
@@ -414,12 +513,12 @@ tbl_pos = switch table_pos
     "Top Left"     => position.top_left
     => position.bottom_left
 
-var table status_tbl = table.new(tbl_pos, 2, 6, bgcolor=color.new(color.black, 20), border_color=color.gray, border_width=1)
+var table status_tbl = table.new(tbl_pos, 2, 7, bgcolor=color.new(color.black, 20), border_color=color.gray, border_width=1)
 
 label_cell_bg = color.rgb(50, 50, 50)
 
 if show_table and barstate.islast
-    setup_str = current_signal == 1 ? (trade_completed ? "BUY (DONE)" : "BUY") : current_signal == -1 ? (trade_completed ? "SELL (DONE)" : "SELL") : "NONE"
+    setup_str = current_signal == 1 ? (trade_completed ? "BUY (CLOSED)" : (tp1_hit_flag ? "BUY (TP1 HIT - RISK FREE)" : "BUY (ACTIVE)")) : current_signal == -1 ? (trade_completed ? "SELL (CLOSED)" : (tp1_hit_flag ? "SELL (TP1 HIT - RISK FREE)" : "SELL (ACTIVE)")) : "NONE"
     setup_bg  = current_signal == 1 ? color.green : current_signal == -1 ? color.red : color.gray
 
     table.cell(status_tbl, 0, 0, "9:30 NY ICT SETUP", bgcolor=color.purple, text_color=color.white, text_size=size.small)
@@ -433,16 +532,26 @@ if show_table and barstate.islast
     table.cell(status_tbl, 1, 2, na(signal_entry) ? "NONE" : str.tostring(signal_entry, "#.#####"), text_color=color.white, text_size=size.small)
 
     table.cell(status_tbl, 0, 3, "Stop Loss", bgcolor=label_cell_bg, text_color=color.white, text_size=size.small)
-    table.cell(status_tbl, 1, 3, na(signal_sl) ? "NONE" : str.tostring(signal_sl, "#.#####"), text_color=color.red, text_size=size.small)
+    sl_text = na(signal_current_sl) ? "NONE" : (risk_removed_flag ? "BE: " + str.tostring(signal_current_sl, "#.#####") : str.tostring(signal_current_sl, "#.#####"))
+    table.cell(status_tbl, 1, 3, sl_text, bgcolor=risk_removed_flag ? color.teal : color.maroon, text_color=color.white, text_size=size.small)
 
-    table.cell(status_tbl, 0, 4, "Take Profit", bgcolor=label_cell_bg, text_color=color.white, text_size=size.small)
-    table.cell(status_tbl, 1, 4, na(signal_tp) ? "NONE" : str.tostring(signal_tp, "#.#####"), text_color=color.green, text_size=size.small)
+    table.cell(status_tbl, 0, 4, "TP1 Target (50%)", bgcolor=label_cell_bg, text_color=color.white, text_size=size.small)
+    tp1_text = na(signal_tp1) ? "NONE" : str.tostring(signal_tp1, "#.#####") + " (1:" + str.tostring(tp1_rr_ratio, "#.#") + ")"
+    table.cell(status_tbl, 1, 4, tp1_text, bgcolor=tp1_hit_flag ? color.green : color.blue, text_color=color.white, text_size=size.small)
 
-    table.cell(status_tbl, 0, 5, "Risk:Reward", bgcolor=label_cell_bg, text_color=color.white, text_size=size.small)
-    table.cell(status_tbl, 1, 5, "1:" + str.tostring(rr_ratio, "#.#"), bgcolor=color.yellow, text_color=color.black, text_size=size.small)
+    table.cell(status_tbl, 0, 5, "TP2 Target (Runner)", bgcolor=label_cell_bg, text_color=color.white, text_size=size.small)
+    tp2_text = na(signal_tp2) ? "NONE" : str.tostring(signal_tp2, "#.#####") + " (1:" + str.tostring(tp2_rr_ratio, "#.#") + ")"
+    table.cell(status_tbl, 1, 5, tp2_text, bgcolor=tp2_hit_flag ? color.green : color.olive, text_color=color.white, text_size=size.small)
+
+    table.cell(status_tbl, 0, 6, "Risk Status", bgcolor=label_cell_bg, text_color=color.white, text_size=size.small)
+    risk_status_str = not pending_order_active and not trade_completed ? "NO TRADE" : (trade_completed ? "TRADE CLOSED" : (risk_removed_flag ? "RISK FREE (SL @ BE)" : "FULL RISK"))
+    risk_status_bg  = risk_removed_flag ? color.teal : (pending_order_active ? color.orange : color.gray)
+    table.cell(status_tbl, 1, 6, risk_status_str, bgcolor=risk_status_bg, text_color=color.white, text_size=size.small)
 
 // Static Alertcondition definitions
-alertcondition(buy_signal, title="Alpaca BUY Webhook", message='{"passcode": "MY_SECRET_PASSCODE", "symbol": "{{ticker}}", "action": "BUY"}')
-alertcondition(sell_signal, title="Alpaca SELL Webhook", message='{"passcode": "MY_SECRET_PASSCODE", "symbol": "{{ticker}}", "action": "SELL"}')
-alertcondition(cancel_signal, title="Alpaca CANCEL Webhook", message='{"passcode": "MY_SECRET_PASSCODE", "symbol": "{{ticker}}", "action": "CANCEL"}')
-
+alertcondition(buy_signal, title="Deriv BUY Webhook", message='{"passcode": "MY_SECRET_PASSCODE", "symbol": "{{ticker}}", "action": "BUY"}')
+alertcondition(sell_signal, title="Deriv SELL Webhook", message='{"passcode": "MY_SECRET_PASSCODE", "symbol": "{{ticker}}", "action": "SELL"}')
+alertcondition(partial_tp_signal, title="Deriv PARTIAL TP Webhook", message='{"passcode": "MY_SECRET_PASSCODE", "symbol": "{{ticker}}", "action": "PARTIAL_TP"}')
+alertcondition(full_tp_signal, title="Deriv FULL TP Webhook", message='{"passcode": "MY_SECRET_PASSCODE", "symbol": "{{ticker}}", "action": "FULL_TP"}')
+alertcondition(sl_hit_signal, title="Deriv SL HIT Webhook", message='{"passcode": "MY_SECRET_PASSCODE", "symbol": "{{ticker}}", "action": "SL_HIT"}')
+alertcondition(cancel_signal, title="Deriv CANCEL Webhook", message='{"passcode": "MY_SECRET_PASSCODE", "symbol": "{{ticker}}", "action": "CANCEL"}')

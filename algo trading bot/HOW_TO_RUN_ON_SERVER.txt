@@ -1,0 +1,28 @@
+========================================================================
+           MT5 9:30 NY ICT AUTOMATED TRADING BOT SETUP
+========================================================================
+
+Broker Account: #32358784 (Deriv.com Limited - Deriv-Demo)
+Strategy: 9:30 AM NY Open 15m Range + 1m FVG Retracement
+Position Sizing: 1.0% Dynamic Account Risk Sizing
+Target Pairs: EURUSD, GBPUSD, USDCAD, BTCUSD
+
+------------------------------------------------------------------------
+STEPS TO RUN ON YOUR AZURE WINDOWS SERVER:
+------------------------------------------------------------------------
+
+1. Copy this entire "algo trading bot" folder to your Azure Server
+   (e.g., paste it to C:\algo trading bot or C:\Users\azureuser\Desktop).
+
+2. Make sure MetaTrader 5 (Deriv.com) is installed & running on the server:
+   - Logged into Account #32358784 on server Deriv-Demo.
+   - Algo Trading is enabled (green icon at the top of MT5).
+
+3. Open Command Prompt on the Azure Server inside this folder and run:
+   pip install -r requirements.txt
+
+4. Double-click "start_bot.bat" (or run: python mt5_live_bot.py).
+
+5. Disconnect from Remote Desktop without logging off.
+   The bot will run 24/7 in the background!
+========================================================================

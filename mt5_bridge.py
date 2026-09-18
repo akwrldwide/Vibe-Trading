@@ -12,14 +12,24 @@ try:
 except ImportError:
     MT5_AVAILABLE = False
 
+from dotenv import load_dotenv
+import journal_db
+
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# Ensure SQLite journal database is initialized on startup
+try:
+    journal_db.init_db()
+except Exception as e:
+    logging.warning(f"Journal DB init warning: {e}")
 
 WEBHOOK_PASSCODE = os.getenv("WEBHOOK_PASSCODE", "MY_SECRET_PASSCODE")
 MT5_ACCOUNT = int(os.getenv("MT5_ACCOUNT", 0)) if os.getenv("MT5_ACCOUNT") else None
 MT5_PASSWORD = os.getenv("MT5_PASSWORD", "")
 MT5_SERVER = os.getenv("MT5_SERVER", "")
+BROKER_NAME = os.getenv("BROKER_NAME", "Deriv (SVG) LLC")
 DEFAULT_LOT_SIZE = float(os.getenv("DEFAULT_LOT_SIZE", 0.1))
 LOG_FILE = "mt5_trades_log.json"
 
@@ -34,11 +44,42 @@ def record_trade_log(trade_data: dict):
         except Exception:
             trades = []
 
-    trade_data["timestamp"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    now_utc = datetime.utcnow()
+    trade_data["timestamp"] = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
     trades.append(trade_data)
 
     with open(LOG_FILE, "w") as f:
         json.dump(trades, f, indent=2)
+
+    # Persist directly into SQLite trading_journal.db
+    try:
+        status_str = trade_data.get("status", "SUBMITTED").upper()
+        outcome = "OPEN"
+        if status_str in ["SUBMITTED", "EXECUTED"]:
+            outcome = "OPEN"
+        elif status_str in ["FAILED", "ERROR"]:
+            outcome = "FAILED"
+        elif status_str in ["CANCELED"]:
+            outcome = "CANCELED"
+
+        db_trade = {
+            "trade_date": now_utc.strftime("%Y-%m-%d"),
+            "ny_time": now_utc.strftime("%I:%M %p"),
+            "symbol": trade_data.get("symbol", "BTCUSD"),
+            "action": trade_data.get("action", "BUY"),
+            "setup_type": "9:30 NY ICT FVG Retracement",
+            "htf_bias": "15M 50 EMA",
+            "entry_price": float(trade_data.get("exec_price", trade_data.get("limit_price", 0.0)) or 0.0),
+            "stop_loss": float(trade_data.get("stop_loss", 0.0) or 0.0),
+            "take_profit": float(trade_data.get("take_profit", 0.0) or 0.0),
+            "rr_ratio": 2.0,
+            "outcome": outcome,
+            "notes": f"MT5 Webhook Bridge Ticket #{trade_data.get('mt5_order', 'N/A')} | Broker: {BROKER_NAME} | Status: {status_str}"
+        }
+        journal_db.add_trade(db_trade)
+        logging.info(f"📖 Trade synced to SQLite journal database (trading_journal.db) for {trade_data.get('symbol')}")
+    except Exception as e:
+        logging.warning(f"Failed to record trade in SQLite journal database: {e}")
 
 def init_mt5():
     if not MT5_AVAILABLE:
@@ -80,22 +121,44 @@ def execute_mt5_trade(symbol: str, action: str, limit_price: float, stop_loss: f
     if not symbol_info.visible:
         mt5.symbol_select(symbol, True)
 
-    order_type = mt5.ORDER_TYPE_BUY_LIMIT if action == "BUY" else mt5.ORDER_TYPE_SELL_LIMIT
+    tick = mt5.symbol_info_tick(symbol)
+    stops_level_pts = symbol_info.trade_stops_level if symbol_info.trade_stops_level > 0 else 20
+    stops_level_dist = stops_level_pts * symbol_info.point
+
+    if action == "BUY":
+        if tick and limit_price >= (tick.ask - stops_level_dist):
+            trade_action = mt5.TRADE_ACTION_DEAL
+            order_type = mt5.ORDER_TYPE_BUY
+            exec_price = tick.ask
+        else:
+            trade_action = mt5.TRADE_ACTION_PENDING
+            order_type = mt5.ORDER_TYPE_BUY_LIMIT
+            exec_price = limit_price
+    else:
+        if tick and limit_price <= (tick.bid + stops_level_dist):
+            trade_action = mt5.TRADE_ACTION_DEAL
+            order_type = mt5.ORDER_TYPE_SELL
+            exec_price = tick.bid
+        else:
+            trade_action = mt5.TRADE_ACTION_PENDING
+            order_type = mt5.ORDER_TYPE_SELL_LIMIT
+            exec_price = limit_price
 
     request = {
-        "action": mt5.TRADE_ACTION_PENDING,
+        "action": trade_action,
         "symbol": symbol,
         "volume": volume,
         "type": order_type,
-        "price": limit_price,
-        "sl": stop_loss,
-        "tp": take_profit,
+        "price": round(exec_price, symbol_info.digits),
+        "sl": round(stop_loss, symbol_info.digits),
+        "tp": round(take_profit, symbol_info.digits),
         "deviation": 10,
         "magic": 9301,
         "comment": "9:30 NY ICT Signal",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
+        "type_filling": mt5.ORDER_FILLING_IOC if trade_action == mt5.TRADE_ACTION_DEAL else mt5.ORDER_FILLING_IOC,
     }
+    if trade_action == mt5.TRADE_ACTION_PENDING:
+        request["type_time"] = mt5.ORDER_TIME_GTC
 
     result = mt5.order_send(request)
     logging.info(f"MT5 Order Send Result: {result}")
@@ -104,6 +167,7 @@ def execute_mt5_trade(symbol: str, action: str, limit_price: float, stop_loss: f
         "symbol": symbol,
         "action": action,
         "limit_price": limit_price,
+        "exec_price": exec_price,
         "stop_loss": stop_loss,
         "take_profit": take_profit,
         "volume": volume,

@@ -1,0 +1,359 @@
+//@version=6
+strategy("Deriv BTCUSD 9:30 AM NY ICT Strategy [2% Risk, Max 2 Trades/Day]", 
+         overlay=true, 
+         initial_capital=100000, 
+         default_qty_type=strategy.percent_of_equity, 
+         default_qty_value=2.0, 
+         commission_type=strategy.commission.percent, 
+         commission_value=0.05, 
+         slippage=2,
+         max_boxes_count=100,
+         max_lines_count=100,
+         max_labels_count=100)
+
+// ==============================================================================
+// 1. INPUT PARAMETERS & STRATEGY SETTINGS
+// ==============================================================================
+var string G_ACC      = "1. Account & Risk Management (Deriv SVG LLC)"
+accountRiskPct        = input.float(2.0, "Risk Per Trade (% Account Equity)", minval=0.1, maxval=10.0, step=0.1, group=G_ACC)
+maxDailyTrades        = input.int(2, "Max Trades Per Day", minval=1, maxval=10, group=G_ACC)
+requireSlForSecondTrade = input.bool(true, "Require SL on Trade 1 for Trade 2 (Loss Recovery)", group=G_ACC)
+rrRatio               = input.float(2.0, "Risk-to-Reward Ratio (1:X)", minval=1.0, maxval=10.0, step=0.1, group=G_ACC)
+slBufferPips          = input.float(2.0, "Stop Loss Buffer (Points / Pips)", minval=0.0, step=0.5, group=G_ACC)
+
+var string G_TIMING   = "2. Session & Timing Controls (New York Time)"
+timeZoneInput         = input.string("America/New_York", "Timezone", group=G_TIMING)
+allowWeekendTrading   = input.bool(false, "Allow Trading on Saturdays & Sundays", group=G_TIMING)
+
+var string G_FILTER   = "3. HTF Trend Filter"
+useHtfFilter          = input.bool(true, "Enable 15m HTF 50 EMA Filter", group=G_FILTER)
+htfEmaLen             = input.int(50, "HTF EMA Length", minval=10, group=G_FILTER)
+
+var string G_WEBHOOK  = "4. Webhook Alert Payload Settings"
+webhookPasscode       = input.string("MY_SECRET_PASSCODE", "Webhook Passcode", group=G_WEBHOOK)
+targetSymbol          = input.string("BTCUSD", "Target Symbol Name for MT5 Bridge", group=G_WEBHOOK)
+
+var string G_UI       = "5. Chart UI & Display Controls"
+showHtfEma            = input.bool(true, "Show 15m 50 EMA Line", group=G_UI)
+showOrLevels          = input.bool(true, "Show 9:30 OR Range High/Low Lines", group=G_UI)
+showTradeLevels       = input.bool(true, "Show Trade Entry / SL / TP Lines & Badges", group=G_UI)
+showFvgBoxes          = input.bool(true, "Show FVG Gap Boxes", group=G_UI)
+showSessionBg         = input.bool(true, "Highlight 9:30 Trading Session Background", group=G_UI)
+showDashboard         = input.bool(true, "Show Strategy HUD Dashboard", group=G_UI)
+dashPosition          = input.string(position.top_right, "HUD Position", options=[position.top_right, position.bottom_right, position.top_left, position.bottom_left], group=G_UI)
+
+// ==============================================================================
+// 2. TIMING & SESSION CALCULATIONS (EXACT NEW YORK EST TIME)
+// ==============================================================================
+nyHour   = hour(time, timeZoneInput)
+nyMinute = minute(time, timeZoneInput)
+nyTime   = nyHour * 100 + nyMinute
+
+isWeekday        = (dayofweek(time, timeZoneInput) != dayofweek.saturday) and (dayofweek(time, timeZoneInput) != dayofweek.sunday)
+isOrWindow       = (nyTime >= 0930) and (nyTime < 0945) and (isWeekday or allowWeekendTrading)   // 09:30 - 09:45 AM NY Opening Range
+isTradeWindow    = (nyTime >= 0945) and (nyTime <= 1130) and (isWeekday or allowWeekendTrading)  // 09:45 - 11:30 AM NY Trade Window
+isFirstOrBar     = (nyTime == 0930) and (nyTime[1] != 0930)
+isFirstTradeBar  = (nyTime == 0945) and (nyTime[1] != 0945)
+
+nyDayTs     = time("D", timeZoneInput)
+nyDayChange = ta.change(nyDayTs)
+isNewDay    = not na(nyDayChange) and nyDayChange != 0
+
+// Highlight active session background strictly during 9:30 session
+bgcolor(showSessionBg and isTradeWindow ? color.new(color.blue, 95) : na, title="Trading Session Background")
+bgcolor(showSessionBg and isOrWindow ? color.new(color.orange, 90) : na, title="9:30 OR Session Background")
+
+// Persistent Daily Variables
+var float dayOrHigh      = na
+var float dayOrLow       = na
+var float lockedOrHigh   = na
+var float lockedOrLow    = na
+var int   dayOrStartBar  = na
+var int   tradesToday    = 0
+var int   breakoutState  = 0 // 1 = Bullish Breakout, -1 = Bearish Breakout, 0 = Neutral
+var bool  allowSecondTrade = false
+var int   closedTradesCount = 0
+
+var line orHighLine      = na
+var line orLowLine       = na
+
+var box  activeFvgBox    = na
+var line activeEntryLine = na
+var line activeSlLine    = na
+var line activeTpLine    = na
+var label activeEntryLbl = na
+var label activeSlLbl    = na
+var label activeTpLbl    = na
+
+if isNewDay
+    dayOrHigh       := na
+    dayOrLow        := na
+    lockedOrHigh    := na
+    lockedOrLow     := na
+    dayOrStartBar   := na
+    tradesToday     := 0
+    breakoutState   := 0
+    allowSecondTrade := false
+    orHighLine      := na
+    orLowLine       := na
+    activeFvgBox    := na
+    activeEntryLine := na
+    activeSlLine    := na
+    activeTpLine    := na
+    activeEntryLbl  := na
+    activeSlLbl     := na
+    activeTpLbl     := na
+
+// Track 09:30 AM - 09:45 AM EST 1-Minute Candle Highs & Lows
+if isOrWindow
+    if isFirstOrBar or na(dayOrHigh)
+        dayOrHigh     := high
+        dayOrLow      := low
+        dayOrStartBar := bar_index
+    else
+        dayOrHigh := math.max(dayOrHigh, high)
+        dayOrLow  := math.min(dayOrLow, low)
+
+// LOCK OPENING RANGE AT 09:45 AM EST AND DRAW LEVEL LINES
+if isFirstTradeBar or (isTradeWindow and na(lockedOrHigh) and not na(dayOrHigh))
+    lockedOrHigh := dayOrHigh
+    lockedOrLow  := dayOrLow
+    
+    if showOrLevels and not na(lockedOrHigh)
+        if not na(orHighLine)
+            line.delete(orHighLine)
+        if not na(orLowLine)
+            line.delete(orLowLine)
+            
+        startBar = not na(dayOrStartBar) ? dayOrStartBar : bar_index - 15
+        sessionEndBar = bar_index + 105
+        orHighLine := line.new(x1=startBar, y1=lockedOrHigh, x2=sessionEndBar, y2=lockedOrHigh, color=color.green, width=2, style=line.style_solid)
+        orLowLine  := line.new(x1=startBar, y1=lockedOrLow,  x2=sessionEndBar, y2=lockedOrLow,  color=color.red,   width=2, style=line.style_solid)
+
+orMid = not na(lockedOrHigh) and not na(lockedOrLow) ? (lockedOrHigh + lockedOrLow) / 2.0 : na
+
+// Breakout State Tracking with Midpoint Invalidation
+if isTradeWindow and not na(orMid)
+    if breakoutState == 1 and close < orMid
+        breakoutState := 0
+    else if breakoutState == -1 and close > orMid
+        breakoutState := 0
+        
+    if not na(lockedOrHigh) and close > lockedOrHigh
+        breakoutState := 1
+    else if not na(lockedOrLow) and close < lockedOrLow
+        breakoutState := -1
+
+// ==============================================================================
+// 3. INDICATOR & TREND CALCULATIONS (SMOOTH EMA CURVE)
+// ==============================================================================
+htfEmaSmooth = ta.ema(close, htfEmaLen * 15)
+
+// Strict 15m 50 EMA trend direction
+isHtfBull = close > htfEmaSmooth
+isHtfBear = close < htfEmaSmooth
+
+htfOkLong  = not useHtfFilter or isHtfBull
+htfOkShort = not useHtfFilter or isHtfBear
+
+plot(showHtfEma ? htfEmaSmooth : na, "15m 50 EMA Smooth Line", color=isHtfBull ? color.teal : color.maroon, linewidth=2)
+
+// ==============================================================================
+// 4. 1-MINUTE FVG DETECTION & ENTRY LOGIC (QUALIFIED BREAKOUT STATE MACHINE)
+// ==============================================================================
+atrVal = ta.atr(14)
+minGapSize = atrVal * 0.10
+
+// Bullish FVG: Low[0] > High[2] with valid gap size
+bullGapSize  = low - high[2]
+fvgBullish   = (low > high[2]) and (bullGapSize >= minGapSize)
+fvgBullishCE = (high[2] + low) / 2.0
+
+// Bearish FVG: High[0] < Low[2] with valid gap size
+bearGapSize  = low[2] - high
+fvgBearish   = (high < low[2]) and (bearGapSize >= minGapSize)
+fvgBearishCE = (low[2] + high) / 2.0
+
+// Qualification Rules matching Official ICT 9:30 Indicator:
+bullishC1Breakout    = not na(lockedOrHigh) and (close[2] > lockedOrHigh and close[3] <= lockedOrHigh)
+bullishC2Breakout    = not na(lockedOrHigh) and (close[1] > lockedOrHigh and close[2] <= lockedOrHigh)
+bullishAfterBreakout = (breakoutState == 1) and (close[2] > lockedOrHigh and close[1] > lockedOrHigh)
+validBullishPos      = bullishC1Breakout or bullishC2Breakout or bullishAfterBreakout
+bullishC3Confirms    = not na(lockedOrHigh) and (close > lockedOrHigh)
+
+bearishC1Breakout    = not na(lockedOrLow) and (close[2] < lockedOrLow and close[3] >= lockedOrLow)
+bearishC2Breakout    = not na(lockedOrLow) and (close[1] < lockedOrLow and close[2] >= lockedOrLow)
+bearishAfterBreakout = (breakoutState == -1) and (close[2] < lockedOrLow and close[1] < lockedOrLow)
+validBearishPos      = bearishC1Breakout or bearishC2Breakout or bearishAfterBreakout
+bearishC3Confirms    = not na(lockedOrLow) and (close < lockedOrLow)
+
+// Track closed trade outcomes to enforce Trade 2 Loss Recovery
+if strategy.closedtrades > closedTradesCount
+    closedTradesCount := strategy.closedtrades
+    lastProfit = strategy.closedtrades.profit(closedTradesCount - 1)
+    if lastProfit < 0
+        allowSecondTrade := true
+    else
+        allowSecondTrade := not requireSlForSecondTrade
+
+canTradeToday   = (tradesToday == 0) or (tradesToday == 1 and allowSecondTrade and strategy.position_size == 0)
+validSetupTime  = isTradeWindow and (tradesToday < maxDailyTrades) and canTradeToday and barstate.isconfirmed
+
+longSignal  = validSetupTime and fvgBullish and validBullishPos and bullishC3Confirms and htfOkLong and (strategy.position_size == 0)
+shortSignal = validSetupTime and fvgBearish and validBearishPos and bearishC3Confirms and htfOkShort and (strategy.position_size == 0)
+
+// ==============================================================================
+// 5. POSITION SIZING & EXECUTION ENGINE (PERMANENT CANDLE-LOCKED DRAWINGS)
+// ==============================================================================
+pipVal = syminfo.mintick * 10
+bufferVal = slBufferPips * syminfo.mintick
+
+var float activeEntry = na
+var float activeSL    = na
+var float activeTP    = na
+var float riskDist    = na
+var float structLow   = na
+var float structHigh  = na
+
+if longSignal
+    activeEntry := fvgBullishCE
+    structLow   := math.min(low, math.min(low[1], math.min(low[2], low[3])))
+    activeSL    := structLow - bufferVal
+    riskDist    := activeEntry - activeSL
+    
+    if riskDist > 0
+        activeTP := activeEntry + (riskDist * rrRatio)
+        strategy.entry("Long", strategy.long, limit=activeEntry)
+        strategy.exit("Exit Long", "Long", stop=activeSL, limit=activeTP)
+        tradesToday := tradesToday + 1
+        
+        // Lock drawings to the exact FVG formation candles (-2 to +25)
+        targetLeft  = bar_index - 2
+        targetRight = bar_index + 25
+        
+        // Delete previous trade drawing set to keep chart clean
+        if not na(activeFvgBox)
+            box.delete(activeFvgBox)
+        if not na(activeEntryLine)
+            line.delete(activeEntryLine)
+            label.delete(activeEntryLbl)
+            line.delete(activeSlLine)
+            label.delete(activeSlLbl)
+            line.delete(activeTpLine)
+            label.delete(activeTpLbl)
+
+        // Create drawings anchored cleanly to the FVG setup candles
+        if showFvgBoxes
+            activeFvgBox := box.new(left=targetLeft, top=low, right=targetRight, bottom=high[2], border_color=color.purple, border_width=2, bgcolor=color.new(color.purple, 75))
+            
+        if showTradeLevels
+            activeEntryLine := line.new(x1=targetLeft, y1=activeEntry, x2=targetRight, y2=activeEntry, color=color.blue, width=2, style=line.style_solid)
+            activeEntryLbl  := label.new(x=targetRight, y=activeEntry, text="ENTRY: " + str.tostring(activeEntry, "#.##"), color=color.new(color.blue, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
+            
+            activeSlLine    := line.new(x1=targetLeft, y1=activeSL, x2=targetRight, y2=activeSL, color=color.red, width=2, style=line.style_dashed)
+            activeSlLbl     := label.new(x=targetRight, y=activeSL, text="SL: " + str.tostring(activeSL, "#.##"), color=color.new(color.red, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
+            
+            activeTpLine    := line.new(x1=targetLeft, y1=activeTP, x2=targetRight, y2=activeTP, color=color.green, width=2, style=line.style_dashed)
+            activeTpLbl     := label.new(x=targetRight, y=activeTP, text="TP: " + str.tostring(activeTP, "#.##"), color=color.new(color.green, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
+
+if shortSignal
+    activeEntry := fvgBearishCE
+    structHigh  := math.max(high, math.max(high[1], math.max(high[2], high[3])))
+    activeSL    := structHigh + bufferVal
+    riskDist    := activeSL - activeEntry
+    
+    if riskDist > 0
+        activeTP := activeEntry - (riskDist * rrRatio)
+        strategy.entry("Short", strategy.short, limit=activeEntry)
+        strategy.exit("Exit Short", "Short", stop=activeSL, limit=activeTP)
+        tradesToday := tradesToday + 1
+        
+        // Lock drawings to the exact FVG formation candles (-2 to +25)
+        targetLeft  = bar_index - 2
+        targetRight = bar_index + 25
+        
+        // Delete previous trade drawing set to keep chart clean
+        if not na(activeFvgBox)
+            box.delete(activeFvgBox)
+        if not na(activeEntryLine)
+            line.delete(activeEntryLine)
+            label.delete(activeEntryLbl)
+            line.delete(activeSlLine)
+            label.delete(activeSlLbl)
+            line.delete(activeTpLine)
+            label.delete(activeTpLbl)
+
+        // Create drawings anchored cleanly to the FVG setup candles
+        if showFvgBoxes
+            activeFvgBox := box.new(left=targetLeft, top=low[2], right=targetRight, bottom=high, border_color=color.purple, border_width=2, bgcolor=color.new(color.purple, 75))
+            
+        if showTradeLevels
+            activeEntryLine := line.new(x1=targetLeft, y1=activeEntry, x2=targetRight, y2=activeEntry, color=color.blue, width=2, style=line.style_solid)
+            activeEntryLbl  := label.new(x=targetRight, y=activeEntry, text="ENTRY: " + str.tostring(activeEntry, "#.##"), color=color.new(color.blue, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
+            
+            activeSlLine    := line.new(x1=targetLeft, y1=activeSL, x2=targetRight, y2=activeSL, color=color.red, width=2, style=line.style_dashed)
+            activeSlLbl     := label.new(x=targetRight, y=activeSL, text="SL: " + str.tostring(activeSL, "#.##"), color=color.new(color.red, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
+            
+            activeTpLine    := line.new(x1=targetLeft, y1=activeTP, x2=targetRight, y2=activeTP, color=color.green, width=2, style=line.style_dashed)
+            activeTpLbl     := label.new(x=targetRight, y=activeTP, text="TP: " + str.tostring(activeTP, "#.##"), color=color.new(color.green, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
+
+if strategy.position_size == 0
+    activeEntry := na
+    activeSL    := na
+    activeTP    := na
+
+// ==============================================================================
+// 6. WEBHOOK ALERTS (STRICT BAR CLOSE)
+// ==============================================================================
+if longSignal and barstate.isconfirmed
+    alertMsgLong = '{"passcode":"' + webhookPasscode + '","action":"BUY","symbol":"' + targetSymbol + '","limit_price":' + str.tostring(fvgBullishCE, "#.##") + ',"stop_loss":' + str.tostring(activeSL, "#.##") + ',"take_profit":' + str.tostring(activeTP, "#.##") + '}'
+    alert(alertMsgLong, alert.freq_once_per_bar_close)
+
+if shortSignal and barstate.isconfirmed
+    alertMsgShort = '{"passcode":"' + webhookPasscode + '","action":"SELL","symbol":"' + targetSymbol + '","limit_price":' + str.tostring(fvgBearishCE, "#.##") + ',"stop_loss":' + str.tostring(activeSL, "#.##") + ',"take_profit":' + str.tostring(activeTP, "#.##") + '}'
+    alert(alertMsgShort, alert.freq_once_per_bar_close)
+
+// ==============================================================================
+// 7. ON-CHART HUD DASHBOARD
+// ==============================================================================
+var table hudTable = na
+
+if barstate.islast and showDashboard
+    if na(hudTable)
+        hudTable := table.new(dashPosition, 2, 7, bgcolor=color.new(#131722, 10), border_color=color.new(color.gray, 40), border_width=1)
+    
+    // Header
+    table.cell(hudTable, 0, 0, "DERIV (SVG) LLC - BTCUSD 9:30 ICT BOT", bgcolor=color.new(#1e222d, 0), text_color=#FFD700, text_size=size.small)
+    table.cell(hudTable, 1, 0, "", bgcolor=color.new(#1e222d, 0))
+    table.merge_cells(hudTable, 0, 0, 1, 0)
+    
+    // Row 1: Account Risk
+    table.cell(hudTable, 0, 1, "Risk Per Trade", text_color=color.white, text_size=size.small)
+    table.cell(hudTable, 1, 1, str.tostring(accountRiskPct, "#.#") + "% Equity", bgcolor=color.new(color.blue, 30), text_color=color.white, text_size=size.small)
+
+    // Row 2: Daily Trades Cap
+    string tradeCapTxt = str.tostring(tradesToday) + " / " + str.tostring(maxDailyTrades) + " Trades"
+    color tradeCapBg   = tradesToday >= maxDailyTrades ? color.new(color.red, 30) : color.new(color.green, 30)
+    table.cell(hudTable, 0, 2, "Daily Trade Limit", text_color=color.white, text_size=size.small)
+    table.cell(hudTable, 1, 2, tradeCapTxt, bgcolor=tradeCapBg, text_color=color.white, text_size=size.small)
+
+    // Row 3: 15m HTF Trend Bias
+    string biasTxt = isHtfBull ? "BULLISH (Above 50 EMA) 🟢" : "BEARISH (Below 50 EMA) 🔴"
+    color biasBg   = isHtfBull ? color.new(color.green, 40) : color.new(color.red, 40)
+    table.cell(hudTable, 0, 3, "15m HTF Bias", text_color=color.white, text_size=size.small)
+    table.cell(hudTable, 1, 3, biasTxt, bgcolor=biasBg, text_color=color.white, text_size=size.small)
+
+    // Row 4: 9:30 Opening Range
+    string orTxt = na(lockedOrHigh) ? "Awaiting 09:30 EST" : "$" + str.tostring(lockedOrLow, "#.#") + " - $" + str.tostring(lockedOrHigh, "#.#")
+    table.cell(hudTable, 0, 4, "9:30 OR Range (15m)", text_color=color.white, text_size=size.small)
+    table.cell(hudTable, 1, 4, orTxt, text_color=color.gray, text_size=size.small)
+
+    // Row 5: Position Status
+    string posTxt = strategy.position_size > 0 ? "IN LONG POSITION 🚀" : strategy.position_size < 0 ? "IN SHORT POSITION 🔻" : "SEARCHING SETUP..."
+    color posBg   = strategy.position_size > 0 ? color.new(color.green, 30) : strategy.position_size < 0 ? color.new(color.red, 30) : color.new(color.gray, 60)
+    table.cell(hudTable, 0, 5, "Position Status", text_color=color.white, text_size=size.small)
+    table.cell(hudTable, 1, 5, posTxt, bgcolor=posBg, text_color=color.white, text_size=size.small)
+
+    // Row 6: Risk-to-Reward Ratio
+    table.cell(hudTable, 0, 6, "Target R:R Ratio", text_color=color.white, text_size=size.small)
+    table.cell(hudTable, 1, 6, "1:" + str.tostring(rrRatio, "#.#") + " (2.0 Target)", text_color=#FFD700, text_size=size.small)
